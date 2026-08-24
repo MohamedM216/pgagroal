@@ -141,8 +141,8 @@ static void init_watcher_message(struct io_watcher* watcher);
 /* context globals */
 
 static struct event_loop* loop = NULL;
-static _Atomic(struct signal_watcher*) signal_watchers[PGAGROAL_NSIG] = {0};
-static _Atomic(signal_cb) signal_callbacks[PGAGROAL_NSIG] = {0};
+static _Atomic(struct signal_watcher*) signal_watchers[PGAGROAL_NSIG];
+static _Atomic(signal_cb) signal_callbacks[PGAGROAL_NSIG];
 
 #if HAVE_LINUX
 
