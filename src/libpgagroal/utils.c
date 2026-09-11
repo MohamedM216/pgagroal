@@ -970,6 +970,43 @@ pgagroal_append_ullong(char* orig, unsigned long long l)
    return pgagroal_format_and_append(orig, "%llu", l);
 }
 
+char*
+pgagroal_append_double(char* orig, double d)
+{
+   return pgagroal_format_and_append(orig, "%lf", d);
+}
+
+char*
+pgagroal_append_double_precision(char* orig, double d, int precision)
+{
+   char* format = NULL;
+   format = pgagroal_append_char(format, '%');
+   format = pgagroal_append_char(format, '.');
+   format = pgagroal_append_int(format, precision);
+   format = pgagroal_append_char(format, 'f');
+
+   orig = pgagroal_format_and_append(orig, format, d);
+
+   free(format);
+
+   return orig;
+}
+
+char*
+pgagroal_append_bool(char* orig, bool b)
+{
+   if (b)
+   {
+      orig = pgagroal_append(orig, "true");
+   }
+   else
+   {
+      orig = pgagroal_append(orig, "false");
+   }
+
+   return orig;
+}
+
 __attribute__((unused)) static bool
 calculate_offset(uint64_t addr, uint64_t* offset, char** filepath)
 {
@@ -1337,6 +1374,24 @@ pgagroal_append_char(char* orig, char c)
    orig = pgagroal_append(orig, str);
 
    return orig;
+}
+
+char*
+pgagroal_append_bytes(char* orig, const char* s, size_t s_length, size_t orig_length)
+{
+   char* n = NULL;
+   if (s == NULL || s_length == 0)
+   {
+      return orig;
+   }
+   n = (char*)realloc(orig, orig_length + s_length + 1);
+   if (n == NULL)
+   {
+      return orig;
+   }
+   memcpy(n + orig_length, s, s_length);
+   n[orig_length + s_length] = '\0';
+   return n;
 }
 
 char*

@@ -163,3 +163,51 @@ cleanup:
    free(s);
    MCTF_FINISH();
 }
+
+MCTF_TEST(test_utils_append_double)
+{
+   char* s = NULL;
+
+   /* %lf writes the whole integer part, so a large double needs far more
+      room than a small fixed buffer: 1e19 alone is 20 digits before the
+      six decimals. */
+   s = pgagroal_append_double(NULL, 1e19);
+   MCTF_ASSERT_PTR_NONNULL(s, cleanup, "append_double returned NULL");
+   MCTF_ASSERT_STR_EQ(s, "10000000000000000000.000000", cleanup, "append_double truncated 1e19");
+   free(s);
+   s = NULL;
+
+   s = pgagroal_append_double(NULL, 0.5);
+   MCTF_ASSERT_STR_EQ(s, "0.500000", cleanup, "append_double wrong for 0.5");
+   free(s);
+   s = NULL;
+
+   s = pgagroal_append_double_precision(NULL, 1e19, 2);
+   MCTF_ASSERT_STR_EQ(s, "10000000000000000000.00", cleanup, "append_double_precision truncated 1e19");
+   free(s);
+   s = NULL;
+
+   s = pgagroal_append_double_precision(NULL, 3.14159, 3);
+   MCTF_ASSERT_STR_EQ(s, "3.142", cleanup, "append_double_precision wrong for 3.14159");
+
+cleanup:
+   free(s);
+   MCTF_FINISH();
+}
+
+MCTF_TEST(test_utils_append_bool)
+{
+   char* s = NULL;
+
+   s = pgagroal_append_bool(NULL, true);
+   MCTF_ASSERT_STR_EQ(s, "true", cleanup, "append_bool wrong for true");
+   free(s);
+   s = NULL;
+
+   s = pgagroal_append_bool(NULL, false);
+   MCTF_ASSERT_STR_EQ(s, "false", cleanup, "append_bool wrong for false");
+
+cleanup:
+   free(s);
+   MCTF_FINISH();
+}

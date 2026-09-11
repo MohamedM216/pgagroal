@@ -522,6 +522,34 @@ char*
 pgagroal_append_ullong(char* orig, unsigned long long l);
 
 /**
+ * Append a double
+ * @param orig The original string
+ * @param d The double
+ * @return The resulting string
+ */
+char*
+pgagroal_append_double(char* orig, double d);
+
+/**
+ * Append a double with set precision
+ * @param orig The original string
+ * @param d The double
+ * @param precision The number of digits after decimal
+ * @return The resulting string
+ */
+char*
+pgagroal_append_double_precision(char* orig, double d, int precision);
+
+/**
+ * Append a bool
+ * @param orig The original string
+ * @param b The bool
+ * @return The resulting string
+ */
+char*
+pgagroal_append_bool(char* orig, bool b);
+
+/**
  * Append a char
  * @param orig The original string
  * @param s The string
@@ -529,6 +557,17 @@ pgagroal_append_ullong(char* orig, unsigned long long l);
  */
 char*
 pgagroal_append_char(char* orig, char c);
+
+/**
+ * Append bytes with an explicit length
+ * @param orig The original string
+ * @param s The bytes
+ * @param s_length The number of bytes
+ * @param orig_length The length of the original string
+ * @return The resulting string
+ */
+char*
+pgagroal_append_bytes(char* orig, const char* s, size_t s_length, size_t orig_length);
 
 /**
  * Indent a string
