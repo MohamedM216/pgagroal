@@ -404,148 +404,69 @@ pgagroal_parse_message(struct pgagroal_message_state* state,
 
    while (offset < length)
    {
-      /*
-       * Something arrived, so we need to check `state` to understand
-       * where we were.
-       */
-
-      if (state->header_len == 5)
+      /* 1. Accumulate header */
+      if (state->header_len < 5)
       {
-         /*
-          * a full header is now present, since it has the length of 5 (kind + length)
-          * therefore get the first byte after the header (e.g., a `I` after a `Z` kind)
-          */
-         state->first_payload_byte = data[offset];
-         offset += 1;
-         state->payload_remaining -= 1;
-         state->header_len = 0; // header read
-
-         if (callback != NULL)
-         {
-            char kind = pgagroal_read_byte(state->header);
-            int msglen = pgagroal_read_int32(state->header + 1) + 1;
-
-            /*
-             * pass the whole thing to the callback, so the kind + length + first byte
-             */
-            char msg[6];
-            memcpy(msg, state->header, 5);
-            msg[5] = state->first_payload_byte;
-            callback(kind, msg, msglen, arg);
-         }
-
-         continue;
-      }
-
-      /*
-       * move forward to consume every other stuff
-       * within the payload
-       */
-      if (state->payload_remaining > 0)
-      {
-         int to_consume = MIN(state->payload_remaining, length - offset);
-         offset += to_consume;
-         state->payload_remaining -= to_consume;
-         continue;
-      }
-
-      /*
-       * here the header has fully arrived and there is nothing
-       * more (no payload)
-       */
-      if (state->header_len == 0 && offset + 5 <= length)
-      {
-         char kind = pgagroal_read_byte(data + offset);
-         int msglen = pgagroal_read_int32(data + offset + 1) + 1;
-
-         if (msglen == 5 || offset + 6 <= length)
-         {
-            /*
-             * payload is present, or the message has none, so the
-             * callback may read past the header (e.g. the Z state byte).
-             */
-            if (callback != NULL)
-            {
-               callback(kind, data + offset, msglen, arg);
-            }
-
-            offset += 5;
-            state->payload_remaining = msglen - 5;
-         }
-         else
-         {
-            /*
-             * header arrived, wait to handle the first payload byte (if any)
-             */
-            memcpy(state->header, data + offset, 5);
-            state->header_len = 5;
-            state->payload_remaining = msglen - 5;
-            offset = length;
-            continue;
-         }
-      }
-      else
-      {
-         /* Buffer a message header split across reads until it is complete */
          int n = MIN(5 - state->header_len, length - offset);
          memcpy(state->header + state->header_len, data + offset, n);
          state->header_len += n;
          offset += n;
-
+         
          if (state->header_len < 5)
          {
-            /* Buffer exhausted mid-header; continue on the next call */
-            continue;
+            break; /* Need more data */
          }
-
-         char kind = pgagroal_read_byte(state->header);
+         
+         /* Header is now complete */
          int msglen = pgagroal_read_int32(state->header + 1) + 1;
-
          state->payload_remaining = msglen - 5;
-
-         if (msglen == 5 || offset < length)
+         state->msg_target_len = msglen;
+         state->first_payload_byte = 0;
+         
+         if (msglen <= PARSE_BUFFER_LIMIT)
          {
-            /* The payload is present, or the message has none */
-            if (msglen > 5)
-            {
-               state->first_payload_byte = data[offset];
-               offset += 1;
-               state->payload_remaining -= 1;
-            }
-            else
-            {
-               state->first_payload_byte = 0;
-            }
-            state->header_len = 0;
-
-            if (callback != NULL)
-            {
-               /* Build a contiguous view so the callback may read msg+5
-                * (e.g. the state byte of a Z message). */
-               char msg[8];
-               memcpy(msg, state->header, 5);
-               msg[5] = state->first_payload_byte;
-               msg[6] = 0;
-               msg[7] = 0;
-               callback(kind, msg, msglen, arg);
-            }
+            memcpy(state->msg_buffer, state->header, 5);
+            state->msg_buffer_len = 5;
          }
          else
          {
-            /* Await the first payload byte in a later call */
-            state->header_len = 5;
-            continue;
+            state->msg_buffer_len = 0; /* Too large to buffer, callbacks won't see it */
          }
       }
-
-      /*
-       * consume any remaining payload
-       */
+      
+      /* 2. Consume payload */
       if (state->payload_remaining > 0)
       {
          int to_consume = MIN(state->payload_remaining, length - offset);
+         
+         if (state->msg_buffer_len > 0 && (state->msg_buffer_len + to_consume) <= PARSE_BUFFER_LIMIT)
+         {
+            memcpy(state->msg_buffer + state->msg_buffer_len, data + offset, to_consume);
+            state->msg_buffer_len += to_consume;
+         }
+         
+         if (state->first_payload_byte == 0 && to_consume > 0)
+         {
+            state->first_payload_byte = data[offset];
+         }
+         
          offset += to_consume;
          state->payload_remaining -= to_consume;
+      }
+      
+      /* 3. Check if message is complete */
+      if (state->payload_remaining == 0 && state->header_len == 5)
+      {
+         if (callback != NULL && state->msg_buffer_len > 0)
+         {
+            char kind = pgagroal_read_byte(state->header);
+            callback(kind, state->msg_buffer, state->msg_target_len, arg);
+         }
+         
+         /* Reset for next message */
+         state->header_len = 0;
+         state->msg_buffer_len = 0;
+         state->msg_target_len = 0;
       }
    }
 }

@@ -45,6 +45,8 @@ extern "C" {
 #define MESSAGE_STATUS_OK    1
 #define MESSAGE_STATUS_ERROR 2
 
+#define PARSE_BUFFER_LIMIT 8192  // 8 KB
+
 /** @struct message
  * Defines a message
  */
@@ -159,6 +161,11 @@ struct pgagroal_message_state
    char first_payload_byte; /**< First byte of the payload, e.g. transaction state for 'Z' */
    int header_len;          /**< Bytes of the header received so far (0-5); 5 means complete */
    int payload_remaining;   /**< Payload bytes not yet consumed from the current message */
+
+   /* Buffer for small messages to ensure callbacks see contiguous payloads */
+   char msg_buffer[PARSE_BUFFER_LIMIT];
+   int msg_buffer_len;
+   int msg_target_len;
 };
 
 /**

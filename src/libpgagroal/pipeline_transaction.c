@@ -211,7 +211,7 @@ transaction_client_message(char kind, char* msg, int msglen __attribute__((unuse
       /* The P message tell us the prepared statement */
       if (kind == 'P')
       {
-         if (msg[5] == '\0')
+         if (pgagroal_read_byte(msg + 5) == '\0')
          {
             deallocate = true;
          }
