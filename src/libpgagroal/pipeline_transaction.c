@@ -251,6 +251,8 @@ transaction_client(struct io_watcher* watcher)
          goto get_error;
       }
 
+      memset(&server_message_state, 0, sizeof(server_message_state));
+
       wi->server_fd = fds[slot];
       wi->server_ssl = s_ssl;
       wi->slot = slot;
@@ -279,7 +281,7 @@ transaction_client(struct io_watcher* watcher)
    {
       pgagroal_prometheus_network_sent_add(msg->length);
 
-      if (likely(msg->kind != 'X'))
+      if (likely(msg->kind != 'X' || client_message_state.payload_remaining > 0 || client_message_state.header_len > 0))
       {
          pgagroal_parse_message(&client_message_state,
                                 msg->data,

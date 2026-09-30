@@ -315,7 +315,7 @@ session_client(struct io_watcher* watcher)
    {
       pgagroal_prometheus_network_sent_add(msg->length);
 
-      if (likely(msg->kind != 'X'))
+      if (likely(msg->kind != 'X' || client_message_state.payload_remaining > 0 || client_message_state.header_len > 0))
       {
          pgagroal_parse_message(&client_message_state,
                                 msg->data,
