@@ -411,18 +411,18 @@ pgagroal_parse_message(struct pgagroal_message_state* state,
          memcpy(state->header + state->header_len, data + offset, n);
          state->header_len += n;
          offset += n;
-         
+
          if (state->header_len < 5)
          {
             break; /* Need more data */
          }
-         
+
          /* Header is now complete */
          int msglen = pgagroal_read_int32(state->header + 1) + 1;
          state->payload_remaining = msglen - 5;
          state->msg_target_len = msglen;
          state->first_payload_byte = 0;
-         
+
          if (msglen <= PARSE_BUFFER_LIMIT)
          {
             memcpy(state->msg_buffer, state->header, 5);
@@ -433,27 +433,27 @@ pgagroal_parse_message(struct pgagroal_message_state* state,
             state->msg_buffer_len = 0; /* Too large to buffer, callbacks won't see it */
          }
       }
-      
+
       /* 2. Consume payload */
       if (state->payload_remaining > 0)
       {
          int to_consume = MIN(state->payload_remaining, length - offset);
-         
+
          if (state->msg_buffer_len > 0 && (state->msg_buffer_len + to_consume) <= PARSE_BUFFER_LIMIT)
          {
             memcpy(state->msg_buffer + state->msg_buffer_len, data + offset, to_consume);
             state->msg_buffer_len += to_consume;
          }
-         
+
          if (state->first_payload_byte == 0 && to_consume > 0)
          {
             state->first_payload_byte = data[offset];
          }
-         
+
          offset += to_consume;
          state->payload_remaining -= to_consume;
       }
-      
+
       /* 3. Check if message is complete */
       if (state->payload_remaining == 0 && state->header_len == 5)
       {
@@ -462,7 +462,7 @@ pgagroal_parse_message(struct pgagroal_message_state* state,
             char kind = pgagroal_read_byte(state->header);
             callback(kind, state->msg_buffer, state->msg_target_len, arg);
          }
-         
+
          /* Reset for next message */
          state->header_len = 0;
          state->msg_buffer_len = 0;

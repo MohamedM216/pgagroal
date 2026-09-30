@@ -45,7 +45,7 @@ extern "C" {
 #define MESSAGE_STATUS_OK    1
 #define MESSAGE_STATUS_ERROR 2
 
-#define PARSE_BUFFER_LIMIT 8192  // 8 KB
+#define PARSE_BUFFER_LIMIT   8192 // 8 KB
 
 /** @struct message
  * Defines a message
