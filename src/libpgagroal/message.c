@@ -593,9 +593,12 @@ pgagroal_pipeline_server_rfq(char kind, char* msg,
       {
          /* msg+6 is valid here because pgagroal_parse_message only fires
           * the callback once the first payload byte has arrived */
-         if (!strncmp(msg + 6, "FATAL", 5) || !strncmp(msg + 6, "PANIC", 5))
+         if (msg[5] == 'S' && msglen >= 12)
          {
-            *(state->fatal) = true;
+            if (!strncmp(msg + 6, "FATAL", 5) || !strncmp(msg + 6, "PANIC", 5))
+            {
+               *(state->fatal) = true;
+            }
          }
       }
    }
