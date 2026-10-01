@@ -55,6 +55,7 @@
 #include <strings.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <openssl/crypto.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/x509.h>
@@ -1149,7 +1150,7 @@ pgagroal_remote_management_scram_sha256(char* username, char* password, int serv
    }
 
    if (server_signature_calc_length != server_signature_received_length ||
-       memcmp(server_signature_received, server_signature_calc, server_signature_calc_length) != 0)
+       CRYPTO_memcmp(server_signature_received, server_signature_calc, server_signature_calc_length) != 0)
    {
       goto bad_password;
    }
@@ -1362,10 +1363,14 @@ compare_auth_response(struct message* orig, struct message* response, int auth_t
    {
       case 3:
       case 5:
-         return strcmp(pgagroal_read_string(orig->data + 5), pgagroal_read_string(response->data + 5));
+         return pgagroal_secure_strcmp(pgagroal_read_string(orig->data + 5), pgagroal_read_string(response->data + 5)) ? 0 : 1;
          break;
       case 10:
-         return memcmp(orig->data, response->data, orig->length);
+         if (orig->length != response->length)
+         {
+            return 1;
+         }
+         return CRYPTO_memcmp(orig->data, response->data, orig->length) != 0;
          break;
       default:
          break;
@@ -1907,7 +1912,7 @@ retry:
       goto error;
    }
 
-   if (!pgagroal_strcmp(pgagroal_read_string(msg->data + 5), password))
+   if (!pgagroal_secure_strcmp(pgagroal_read_string(msg->data + 5), password))
    {
       pgagroal_write_bad_password(c_ssl, client_fd, username);
 
@@ -2175,7 +2180,7 @@ retry:
    }
 
    if (client_proof_received_length != client_proof_calc_length ||
-       memcmp(client_proof_received, client_proof_calc, client_proof_calc_length) != 0)
+       CRYPTO_memcmp(client_proof_received, client_proof_calc, client_proof_calc_length) != 0)
    {
       goto bad_password;
    }
@@ -3097,7 +3102,7 @@ server_scram256(char* username, char* password, int slot, SSL* server_ssl)
    }
 
    if (server_signature_calc_length != server_signature_received_length ||
-       memcmp(server_signature_received, server_signature_calc, server_signature_calc_length) != 0)
+       CRYPTO_memcmp(server_signature_received, server_signature_calc, server_signature_calc_length) != 0)
    {
       goto bad_password;
    }
@@ -4276,7 +4281,7 @@ verify_client_proof(char* s_key, int s_key_length,
       goto error;
    }
 
-   if (memcmp(s_key, s_k, size) != 0)
+   if (CRYPTO_memcmp(s_key, s_k, size) != 0)
    {
       goto error;
    }
@@ -5158,7 +5163,7 @@ pgagroal_scram_client_auth(char* username, char* password, int socket, SSL* serv
    }
 
    if (server_signature_calc_length != server_signature_received_length ||
-       memcmp(server_signature_received, server_signature_calc, server_signature_calc_length) != 0)
+       CRYPTO_memcmp(server_signature_received, server_signature_calc, server_signature_calc_length) != 0)
    {
       goto bad_password;
    }
@@ -6304,7 +6309,7 @@ pgagroal_scram_client_authenticate(char* username, char* password, int server_fd
    }
 
    if (server_signature_calc_length != server_signature_received_length ||
-       memcmp(server_signature_received, server_signature_calc, server_signature_calc_length) != 0)
+       CRYPTO_memcmp(server_signature_received, server_signature_calc, server_signature_calc_length) != 0)
    {
       goto bad_password;
    }
