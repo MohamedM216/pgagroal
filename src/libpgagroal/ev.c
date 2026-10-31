@@ -882,6 +882,7 @@ ev_io_uring_io_start(struct io_watcher* watcher)
       return PGAGROAL_EVENT_RC_ERROR;
    }
 
+   watcher->stopped = false;
    io_uring_sqe_set_data(sqe, watcher);
    switch (watcher->event_watcher.type)
    {
@@ -915,6 +916,10 @@ ev_io_uring_io_stop(struct io_watcher* target)
    struct io_uring_cqe* cqe;
    struct __kernel_timespec ts = {.tv_sec = 2, .tv_nsec = 0};
 
+   /* Mark the watcher first so that it is not re-armed or dispatched
+    * even if no SQE can be acquired below */
+   target->stopped = true;
+
    /* When io_stop is called it may never return to a loop
     * where sqes are submitted. Flush these sqes so the get call
     * doesn't return NULL. */
@@ -935,6 +940,9 @@ ev_io_uring_io_stop(struct io_watcher* target)
    }
 
    io_uring_prep_cancel(sqe, (void*)target, 0);
+   /* The cancel's own completion must not be dispatched to a watcher: a reused
+    * SQE slot still carries the previous user_data */
+   io_uring_sqe_set_data(sqe, NULL);
 
    io_uring_submit_and_wait_timeout(&loop->ring_rcv, &cqe, 0, &ts, NULL);
 
@@ -1197,6 +1205,14 @@ ev_io_uring_handler(struct io_uring_cqe* cqe)
       case PGAGROAL_EVENT_TYPE_WORKER:
          io = (struct io_watcher*)watcher;
          msg = pgagroal_get_watcher_message(io);
+         if (io->stopped)
+         {
+            /* The watcher was stopped while this completion was already
+             * queued: the data belongs to a connection that is no longer
+             * watched */
+            pgagroal_log_trace("io_uring: dropping completion for stopped worker (res=%d)", cqe->res);
+            return PGAGROAL_EVENT_RC_OK;
+         }
          if (cqe->res <= 0)
          {
             if (cqe->res == 0)
@@ -1219,8 +1235,9 @@ ev_io_uring_handler(struct io_uring_cqe* cqe)
             rc = PGAGROAL_EVENT_RC_OK;
             io->cb(io);
 
-            /* Only rearm if loop is still running and connection is good */
-            if (pgagroal_event_loop_is_running())
+            /* Only rearm if loop is still running, the connection is good
+             * and the callback did not stop the watcher */
+            if (pgagroal_event_loop_is_running() && !io->stopped)
             {
                ev_io_uring_io_start(io);
             }

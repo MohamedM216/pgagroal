@@ -147,6 +147,7 @@ struct io_watcher
       int __fds[2];
    } fds;                                  /**< Set of file descriptors used for I/O */
    bool ssl;                               /**< Indicates if SSL/TLS is used on this connection. */
+   bool stopped;                           /**< io_uring worker watchers only: set by io_stop, cleared by io_start; a stopped worker is neither re-armed nor dispatched */
    struct message* msg;                    /**< Per-watcher message buffer to avoid global state races */
    void (*cb)(struct io_watcher* watcher); /**< Event callback. */
 };
