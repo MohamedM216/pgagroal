@@ -33,7 +33,7 @@
 extern "C" {
 #endif
 
-#include <semaphore.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -769,6 +769,30 @@ struct pgagroal_slot_queue
    struct pgagroal_queue_cell cells[SLOT_QUEUE_CAPACITY];     /**< The ring cells */
 };
 
+/** @struct pgagroal_wait_group
+ * A waiter notification group that lives in the shared memory segment of
+ * struct main_configuration: a process-shared pthread mutex guarding a
+ * condition variable and the number of processes currently blocked on it.
+ *
+ * Used by pgagroal_get_connection() to block instead of polling when the
+ * pool is saturated (Queue 2). Producers (pgagroal_return_connection,
+ * pgagroal_kill_connection and the error rollbacks) notify the group after
+ * making a slot available; a notified waiter re-runs its acquisition pass,
+ * whose CAS-based commit on states[slot] remains the correctness guard.
+ *
+ * Process-shared pthread primitives are used instead of unnamed POSIX
+ * semaphores (sem_init with pshared = 1) because unnamed semaphores are
+ * not implemented on macOS (sem_init fails with ENOSYS), while
+ * process-shared mutexes and condition variables work on Linux, FreeBSD
+ * and macOS alike.
+ */
+struct pgagroal_wait_group
+{
+   pthread_mutex_t mutex; /**< Process-shared mutex protecting waiters and cond */
+   pthread_cond_t cond;   /**< Process-shared condition variable waiters sleep on */
+   int waiters;           /**< Number of processes currently blocked on cond */
+};
+
 /** @struct main_configuration
  * Defines the configuration and state of pgagroal
  */
@@ -865,20 +889,21 @@ struct main_configuration
    atomic_uchar free_queued[MAX_NUMBER_OF_CONNECTIONS];   /**< Dedup flag for free_slots */
    atomic_uchar notinit_queued[MAX_NUMBER_OF_CONNECTIONS]; /**< Dedup flag for notinit_slots */
 
-   /* Waiter semaphores (Queue 2). Process-shared POSIX semaphores used by
-    * pgagroal_get_connection() to block instead of polling. Producers
-    * (pgagroal_return_connection / pgagroal_kill_connection and the error
-    * rollbacks) post after making a slot available:
+   /* Waiter notification groups (Queue 2). Process-shared pthread
+    * mutex/condvar pairs used by pgagroal_get_connection() to block instead
+    * of polling. Producers (pgagroal_return_connection /
+    * pgagroal_kill_connection and the error rollbacks) notify after making
+    * a slot available:
     * - a returned (STATE_FREE) slot wakes the rules whose pattern matches
     *   the returned connection's user/database, since only those waiters
     *   can reuse it through the reuse path;
     * - a killed (STATE_NOTINIT) slot can serve any rule's new connection,
     *   so every rule is woken.
-    * The semaphores live outside struct limit so that a configuration
-    * reload (which rewrites the limits[] entries) cannot clobber them,
-    * and they are initialized once, before any fork. */
-   sem_t limit_sems[NUMBER_OF_LIMITS]; /**< One waiter semaphore per limit rule */
-   sem_t no_limit_sem;                 /**< Waiter semaphore when no limit rule matched */
+    * The groups live outside struct limit so that a configuration reload
+    * (which rewrites the limits[] entries) cannot clobber them, and they
+    * are initialized once, before any fork. */
+   struct pgagroal_wait_group limit_waits[NUMBER_OF_LIMITS]; /**< One waiter group per limit rule */
+   struct pgagroal_wait_group no_limit_wait;                 /**< Waiter group when no limit rule matched */
 
    struct server servers[NUMBER_OF_SERVERS];       /**< The servers */
    struct hba hbas[NUMBER_OF_HBAS];                /**< The HBA entries */

@@ -121,8 +121,8 @@ pgagroal_get_connection(char* username, char* database, bool reuse, bool transac
    start_time = time(NULL);
 
    /* Absolute deadline for the blocking wait: blocking_timeout after
-    * entry. It is enforced by sem_timedwait (see wait_for_pool_change),
-    * replacing the former polling deadline check. */
+    * entry. It is enforced by pthread_cond_timedwait (see
+    * wait_for_pool_change), replacing the former polling deadline check. */
    if (pgagroal_time_is_valid(config->blocking_timeout))
    {
       clock_gettime(CLOCK_REALTIME, &block_deadline);
@@ -459,11 +459,11 @@ retry:
 retry2:
       if (pgagroal_time_is_valid(config->blocking_timeout))
       {
-         /* Block on the rule's waiter semaphore instead of polling: the
-          * process sleeps in the kernel with zero CPU usage until a slot
-          * is released (sem_post from return/kill/rollback), the defensive
-          * re-check slice expires, or the blocking_timeout deadline passes
-          * (#813). */
+         /* Block on the rule's waiter notification group instead of
+          * polling: the process sleeps in the kernel with zero CPU usage
+          * until a slot is released (pgagroal_wait_group_notify from
+          * return/kill/rollback), the defensive re-check slice expires,
+          * or the blocking_timeout deadline passes (#813). */
          if (!wait_for_pool_change(config, best_rule, &block_deadline))
          {
             goto timeout;
@@ -1529,6 +1529,34 @@ pgagroal_prefill(bool initial)
    exit(0);
 }
 
+static void
+pgagroal_wait_group_init(struct pgagroal_wait_group* group)
+{
+   pthread_mutexattr_t mattr;
+   pthread_condattr_t cattr;
+
+   /* Process-shared pthread primitives: portable across Linux, FreeBSD and
+    * macOS, unlike unnamed POSIX semaphores (sem_init with pshared = 1 is
+    * not implemented on macOS). */
+   pthread_mutexattr_init(&mattr);
+   pthread_condattr_init(&cattr);
+   pthread_mutexattr_setpshared(&mattr, PTHREAD_PROCESS_SHARED);
+   pthread_condattr_setpshared(&cattr, PTHREAD_PROCESS_SHARED);
+
+   if (pthread_mutex_init(&group->mutex, &mattr))
+   {
+      pgagroal_log_error("pgagroal_wait_group_init: pthread_mutex_init failed (%s)", strerror(errno));
+   }
+   if (pthread_cond_init(&group->cond, &cattr))
+   {
+      pgagroal_log_error("pgagroal_wait_group_init: pthread_cond_init failed (%s)", strerror(errno));
+   }
+   group->waiters = 0;
+
+   pthread_mutexattr_destroy(&mattr);
+   pthread_condattr_destroy(&cattr);
+}
+
 int
 pgagroal_pool_init(void)
 {
@@ -1559,21 +1587,15 @@ pgagroal_pool_init(void)
       pgagroal_queue_push(&config->notinit_slots, i);
    }
 
-   /* Waiter semaphores: process-shared (pshared = 1), one per limit rule
-    * plus one for requests without a matching rule. All NUMBER_OF_LIMITS
-    * semaphores are initialized so that a reload which activates more
-    * rules finds them ready. */
+   /* Waiter notification groups: process-shared mutex/condvar pairs, one
+    * per limit rule plus one for requests without a matching rule. All
+    * NUMBER_OF_LIMITS groups are initialized so that a reload which
+    * activates more rules finds them ready. */
    for (int i = 0; i < NUMBER_OF_LIMITS; i++)
    {
-      if (sem_init(&config->limit_sems[i], 1, 0))
-      {
-         pgagroal_log_error("pgagroal_pool_init: sem_init(limit_sems[%d]) failed (%s)", i, strerror(errno));
-      }
+      pgagroal_wait_group_init(&config->limit_waits[i]);
    }
-   if (sem_init(&config->no_limit_sem, 1, 0))
-   {
-      pgagroal_log_error("pgagroal_pool_init: sem_init(no_limit_sem) failed (%s)", strerror(errno));
-   }
+   pgagroal_wait_group_init(&config->no_limit_wait);
 
    /* Connections */
    for (int i = 0; i < config->max_connections; i++)
@@ -2473,6 +2495,28 @@ slot_mark_notinit(int slot, bool wake)
 }
 
 static void
+pgagroal_wait_group_notify(struct pgagroal_wait_group* group)
+{
+   if (pthread_mutex_lock(&group->mutex))
+   {
+      return;
+   }
+
+   /* Only wake when somebody is actually blocked: with no waiters this is
+    * a no-op, whereas a semaphore would accumulate a stale credit that
+    * wakes a future waiter without a new slot having been released. A
+    * waiter that entered cond_timedwait before the producer locked the
+    * mutex cannot miss the signal, because cond_timedwait releases the
+    * same mutex atomically. */
+   if (group->waiters > 0)
+   {
+      pthread_cond_signal(&group->cond);
+   }
+
+   pthread_mutex_unlock(&group->mutex);
+}
+
+static void
 wake_waiters(int slot, bool is_free)
 {
    char* username;
@@ -2487,9 +2531,9 @@ wake_waiters(int slot, bool is_free)
        * again (one futex wake at most). */
       for (int i = 0; i < config->number_of_limits; i++)
       {
-         sem_post(&config->limit_sems[i]);
+         pgagroal_wait_group_notify(&config->limit_waits[i]);
       }
-      sem_post(&config->no_limit_sem);
+      pgagroal_wait_group_notify(&config->no_limit_wait);
       return;
    }
 
@@ -2507,11 +2551,11 @@ wake_waiters(int slot, bool is_free)
       if ((pgagroal_strcmp("all", config->limits[i].username) || pgagroal_strcmp(username, config->limits[i].username)) &&
           (pgagroal_strcmp("all", config->limits[i].database) || pgagroal_strcmp(database, config->limits[i].database)))
       {
-         sem_post(&config->limit_sems[i]);
+         pgagroal_wait_group_notify(&config->limit_waits[i]);
       }
    }
 
-   sem_post(&config->no_limit_sem);
+   pgagroal_wait_group_notify(&config->no_limit_wait);
 }
 
 static void
@@ -2538,16 +2582,16 @@ timespec_less(struct timespec* a, struct timespec* b)
 static bool
 wait_for_pool_change(struct main_configuration* config, int best_rule, struct timespec* deadline)
 {
+   struct pgagroal_wait_group* group;
    struct timespec now;
    struct timespec wake_up;
-   sem_t* sem;
    int rc;
 
-   /* Wait on the semaphore of the request's rule (or the global one when
-    * no rule matched). Producers post on every availability event, so a
-    * wakeup means the pool may have changed and the acquisition pass is
-    * retried. */
-   sem = (best_rule >= 0) ? &config->limit_sems[best_rule] : &config->no_limit_sem;
+   /* Wait on the notification group of the request's rule (or the global
+    * one when no rule matched). Producers notify on every availability
+    * event, so a wakeup means the pool may have changed and the
+    * acquisition pass is retried. */
+   group = (best_rule >= 0) ? &config->limit_waits[best_rule] : &config->no_limit_wait;
 
    clock_gettime(CLOCK_REALTIME, &now);
    wake_up = now;
@@ -2559,10 +2603,22 @@ wait_for_pool_change(struct main_configuration* config, int best_rule, struct ti
       wake_up = *deadline;
    }
 
-   rc = sem_timedwait(sem, &wake_up);
+   /* Block on the rule's condition variable instead of polling: the
+    * process sleeps in the kernel with zero CPU usage until a slot is
+    * released (pgagroal_wait_group_notify from return/kill/rollback), the
+    * defensive re-check slice expires, or the blocking_timeout deadline
+    * passes (#813). pthread_cond_timedwait() may also return spuriously;
+    * like any wakeup it merely triggers a fresh acquisition pass, whose
+    * CAS-based commit on states[slot] is the real correctness guard. */
+   pthread_mutex_lock(&group->mutex);
+   group->waiters++;
+   rc = pthread_cond_timedwait(&group->cond, &group->mutex, &wake_up);
+   group->waiters--;
+   pthread_mutex_unlock(&group->mutex);
+
    if (rc == 0)
    {
-      /* Woken by a producer (or a stale wakeup credit was available) */
+      /* Woken by a producer (waiters > 0 guaranteed a real signal) */
       return true;
    }
 

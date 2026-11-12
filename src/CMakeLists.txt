@@ -514,7 +514,7 @@ endif (CMAKE_BUILD_TYPE MATCHES Performance)
 add_library(pgagroal SHARED ${SOURCES})
 set_target_properties(pgagroal PROPERTIES LINKER_LANGUAGE C VERSION ${VERSION_STRING}
                                SOVERSION ${VERSION_MAJOR})
-target_link_libraries(pgagroal PUBLIC)
+target_link_libraries(pgagroal PUBLIC ${THREAD_LIBRARIES})
 
 install(TARGETS pgagroal DESTINATION ${CMAKE_INSTALL_LIBDIR}/)
 
