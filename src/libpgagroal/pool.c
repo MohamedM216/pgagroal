@@ -2684,6 +2684,7 @@ wait_for_pool_change(struct main_configuration* config, int best_rule, struct ti
    if (rc == 0)
    {
       /* Woken by a producer (waiters > 0 guaranteed a real signal) */
+      *retry_delay = 0;
       return true;
    }
 
