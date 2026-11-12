@@ -52,6 +52,25 @@
 volatile int exit_code = WORKER_FAILURE;
 
 static void signal_callback(void);
+static bool slot_owned_by_worker(int slot);
+
+/*
+ * A worker owns its slot's acquisition only while connections[slot].pid is
+ * its own pid. A flush/management kill (or the idle/max-age/validation
+ * housekeeping) can end the acquisition and free the slot concurrently with
+ * this worker's exit path - in particular when the worker was SIGQUIT'd by
+ * that very kill. Without this check the exiting worker would run its own
+ * return_connection/kill_connection on a slot that has already been released
+ * and possibly re-acquired by another client, corrupting the new owner's
+ * connection and double-releasing the shared counters.
+ */
+static bool
+slot_owned_by_worker(int slot)
+{
+   struct main_configuration* config = (struct main_configuration*)shmem;
+
+   return slot != -1 && config->connections[slot].pid == getpid();
+}
 
 void
 pgagroal_worker(int client_fd, char* address, char** argv)
@@ -229,21 +248,39 @@ pgagroal_worker(int client_fd, char* address, char** argv)
       {
          if (config->pipeline != PIPELINE_TRANSACTION)
          {
-            pgagroal_tracking_event_socket(TRACKER_SOCKET_DISASSOCIATE_SERVER, config->connections[slot].fd);
-            pgagroal_tracking_event_slot(TRACKER_WORKER_RETURN1, slot);
-            pgagroal_return_connection(slot, server_ssl, tx_pool);
+            if (slot_owned_by_worker(slot))
+            {
+               pgagroal_tracking_event_socket(TRACKER_SOCKET_DISASSOCIATE_SERVER, config->connections[slot].fd);
+               pgagroal_tracking_event_slot(TRACKER_WORKER_RETURN1, slot);
+               pgagroal_return_connection(slot, server_ssl, tx_pool);
+            }
+            else
+            {
+               /* The acquisition was already ended by a concurrent kill
+                * (e.g. the flush that SIGQUIT'd us); its server SSL object
+                * belongs to us process-locally, so release it here */
+               pgagroal_close_ssl(server_ssl);
+            }
          }
       }
       else if (exit_code == WORKER_SERVER_FAILURE || exit_code == WORKER_SERVER_FATAL || exit_code == WORKER_SHUTDOWN || exit_code == WORKER_FAILOVER ||
                (exit_code == WORKER_FAILURE && config->connections[slot].has_security == SECURITY_INVALID))
       {
-         pgagroal_tracking_event_socket(TRACKER_SOCKET_DISASSOCIATE_SERVER, config->connections[slot].fd);
-         pgagroal_tracking_event_slot(TRACKER_WORKER_KILL1, slot);
-         pgagroal_kill_connection(slot, server_ssl);
+         if (slot_owned_by_worker(slot))
+         {
+            pgagroal_tracking_event_socket(TRACKER_SOCKET_DISASSOCIATE_SERVER, config->connections[slot].fd);
+            pgagroal_tracking_event_slot(TRACKER_WORKER_KILL1, slot);
+            pgagroal_kill_connection(slot, server_ssl);
+         }
+         else
+         {
+            pgagroal_close_ssl(server_ssl);
+         }
       }
       else
       {
-         if (pgagroal_socket_isvalid(config->connections[slot].fd) &&
+         if (slot_owned_by_worker(slot) &&
+             pgagroal_socket_isvalid(config->connections[slot].fd) &&
              pgagroal_connection_isvalid(config->connections[slot].fd) &&
              config->connections[slot].has_security != SECURITY_INVALID)
          {
@@ -253,9 +290,16 @@ pgagroal_worker(int client_fd, char* address, char** argv)
          }
          else
          {
-            pgagroal_tracking_event_socket(TRACKER_SOCKET_DISASSOCIATE_SERVER, config->connections[slot].fd);
-            pgagroal_tracking_event_slot(TRACKER_WORKER_KILL2, slot);
-            pgagroal_kill_connection(slot, server_ssl);
+            if (slot_owned_by_worker(slot))
+            {
+               pgagroal_tracking_event_socket(TRACKER_SOCKET_DISASSOCIATE_SERVER, config->connections[slot].fd);
+               pgagroal_tracking_event_slot(TRACKER_WORKER_KILL2, slot);
+               pgagroal_kill_connection(slot, server_ssl);
+            }
+            else
+            {
+               pgagroal_close_ssl(server_ssl);
+            }
          }
       }
    }

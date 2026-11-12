@@ -33,6 +33,7 @@
 extern "C" {
 #endif
 
+#include <semaphore.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -117,6 +118,24 @@ extern "C" {
 #define STATE_INIT                                     -1
 #define STATE_FREE                                     0
 #define STATE_IN_USE                                   1
+
+/* Capacity of the shared-memory slot index queues (see
+ * struct pgagroal_slot_queue). Must be a power of two and must never be
+ * smaller than MAX_NUMBER_OF_CONNECTIONS: the one-entry-per-slot flag
+ * protocol guarantees at most MAX_NUMBER_OF_CONNECTIONS live entries per
+ * queue, so a push can never overflow a queue of this capacity. */
+#define SLOT_QUEUE_CAPACITY                            16384
+
+#if defined(__cplusplus)
+#define PGAGROAL_STATIC_ASSERT(cond, msg) static_assert(cond, msg)
+#else
+#define PGAGROAL_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
+#endif
+
+PGAGROAL_STATIC_ASSERT(SLOT_QUEUE_CAPACITY >= MAX_NUMBER_OF_CONNECTIONS,
+                       "slot queue capacity must hold every slot");
+PGAGROAL_STATIC_ASSERT((SLOT_QUEUE_CAPACITY & (SLOT_QUEUE_CAPACITY - 1)) == 0,
+                       "slot queue capacity must be a power of two");
 #define STATE_GRACEFULLY                               2
 #define STATE_FLUSH                                    3
 #define STATE_IDLE_CHECK                               4
@@ -450,6 +469,20 @@ struct connection
    int fd;                  /**< The descriptor */
    atomic_llong generation; /**< When main received fd (pgagroal_fd_generation), 0 = never */
 
+   /* Counter-release guards. Several processes can concurrently end the
+    * same acquisition (a flush/management kill races with the SIGQUIT'd
+    * worker's own kill_connection, and with the return path). Both used to
+    * check connections[slot].pid != -1 and could decrement the shared
+    * counters twice. The flags make the release exclusive: the first
+    * releaser exchanges false -> true and releases; everyone else skips.
+    * active_released guards the per-rule active_connections + global
+    * active_connections pair (released by return OR kill, whichever comes
+    * first); backend_released guards the per-rule backend_connections
+    * reservation (released only by kill, since a cached STATE_FREE
+    * connection still holds a live backend). */
+   atomic_bool active_released;  /**< Checkout counters already released */
+   atomic_bool backend_released; /**< Backend reservation already released */
+
    size_t tls_context_length;                 /**< Length of the parked backend TLS context, 0 if none */
    char tls_context[TLS_CONTEXT_BUFFER_SIZE]; /**< Serialized backend TLS context for pool resumption */
    bool reset_query_failed;                   /**< Set when reset query failed in ignore mode; skips future attempts */
@@ -702,6 +735,40 @@ struct vault_configuration
    struct vault_server vault_server; /**< The vault servers */
 } __attribute__((aligned(64)));
 
+/** @struct pgagroal_queue_cell
+ * One cell of the bounded MPMC slot index queue (Dmitry Vyukov's
+ * bounded MPMC queue design). The sequence number distinguishes empty,
+ * full and in-flight cells so that any number of producer and consumer
+ * processes can push and pop concurrently with a single CAS per
+ * operation and no mutex.
+ */
+struct pgagroal_queue_cell
+{
+   atomic_uint sequence; /**< Sequence number for the cell (Vyukov protocol) */
+   int slot;             /**< The slot index carried by the cell */
+};
+
+/** @struct pgagroal_slot_queue
+ * A bounded, lock-free, FIFO MPMC queue of slot indices that lives in the
+ * shared memory segment of struct main_configuration. All processes forked
+ * from main operate on the same instance.
+ *
+ * Used as
+ * - free_slots:   indices of slots whose state is STATE_FREE, and
+ * - notinit_slots: indices of slots whose state is STATE_NOTINIT,
+ *
+ * so pgagroal_get_connection() can obtain a candidate slot in O(1)
+ * instead of scanning the states[] array. The queue only carries the
+ * candidate index; ownership is still committed with a CAS on
+ * states[slot], which preserves the existing correctness guarantees.
+ */
+struct pgagroal_slot_queue
+{
+   atomic_uint head;                                          /**< Dequeue position (monotonically increasing) */
+   atomic_uint tail;                                          /**< Enqueue position (monotonically increasing) */
+   struct pgagroal_queue_cell cells[SLOT_QUEUE_CAPACITY];     /**< The ring cells */
+};
+
 /** @struct main_configuration
  * Defines the configuration and state of pgagroal
  */
@@ -782,6 +849,37 @@ struct main_configuration
    int number_of_admins;         /**< The number of admins */
 
    atomic_schar states[MAX_NUMBER_OF_CONNECTIONS]; /**< The states */
+
+   /* Slot index queues. Both are initialized by pgagroal_pool_init()
+    * before any worker is forked and never re-initialized afterwards
+    * (a configuration reload must not disturb them). */
+   struct pgagroal_slot_queue free_slots;   /**< Indices of slots in STATE_FREE */
+   struct pgagroal_slot_queue notinit_slots; /**< Indices of slots in STATE_NOTINIT */
+
+   /* One-entry-per-slot dedup flags for the queues above. Flag = 1 means
+    * "an entry for this slot is queued (or is being enqueued/popped)", so
+    * a slot can never occupy more than one cell of a queue and a push can
+    * never overflow. A pop clears the flag before the state CAS; a
+    * transition into the state sets it and pushes only when it exchanged
+    * 0 -> 1. */
+   atomic_uchar free_queued[MAX_NUMBER_OF_CONNECTIONS];   /**< Dedup flag for free_slots */
+   atomic_uchar notinit_queued[MAX_NUMBER_OF_CONNECTIONS]; /**< Dedup flag for notinit_slots */
+
+   /* Waiter semaphores (Queue 2). Process-shared POSIX semaphores used by
+    * pgagroal_get_connection() to block instead of polling. Producers
+    * (pgagroal_return_connection / pgagroal_kill_connection and the error
+    * rollbacks) post after making a slot available:
+    * - a returned (STATE_FREE) slot wakes the rules whose pattern matches
+    *   the returned connection's user/database, since only those waiters
+    *   can reuse it through the reuse path;
+    * - a killed (STATE_NOTINIT) slot can serve any rule's new connection,
+    *   so every rule is woken.
+    * The semaphores live outside struct limit so that a configuration
+    * reload (which rewrites the limits[] entries) cannot clobber them,
+    * and they are initialized once, before any fork. */
+   sem_t limit_sems[NUMBER_OF_LIMITS]; /**< One waiter semaphore per limit rule */
+   sem_t no_limit_sem;                 /**< Waiter semaphore when no limit rule matched */
+
    struct server servers[NUMBER_OF_SERVERS];       /**< The servers */
    struct hba hbas[NUMBER_OF_HBAS];                /**< The HBA entries */
    struct limit limits[NUMBER_OF_LIMITS];          /**< The limit entries */

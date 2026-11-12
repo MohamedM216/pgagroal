@@ -36,6 +36,7 @@
 #include <message.h>
 #include <pool.h>
 #include <prometheus.h>
+#include <queue.h>
 #include <security.h>
 #include <server.h>
 #include <tls.h>
@@ -68,6 +69,23 @@ static void check_graceful_shutdown_trigger(void);
 static bool increase_connections(int best_rule);
 static bool fetch_descriptor(int slot);
 static bool holds_descriptor(int slot);
+static bool pop_free_slot(struct main_configuration* config, int* slot);
+static bool pop_notinit_slot(struct main_configuration* config, int* slot);
+static void requeue_free_slot(struct main_configuration* config, int slot);
+static void requeue_notinit_slot(struct main_configuration* config, int slot);
+static void slot_mark_free(int slot, bool wake);
+static void slot_mark_notinit(int slot, bool wake);
+static void wake_waiters(int slot, bool is_free);
+static bool wait_for_pool_change(struct main_configuration* config, int best_rule, struct timespec* deadline);
+static void timespec_add_ns(struct timespec* ts, long ns);
+static bool timespec_less(struct timespec* a, struct timespec* b);
+
+/* Defensive re-check slice for the blocking wait. Producers post on every
+ * availability event, but a waiter can race with an in-flight ring entry
+ * (popped by another process, not yet re-queued); the slice bounds the
+ * worst-case re-check latency while still sleeping in the kernel with
+ * zero CPU usage between wakes. */
+#define POOL_WAIT_SLICE_NS 50000000L /* 50ms */
 
 int pgagroal_known_fds[MAX_NUMBER_OF_CONNECTIONS];
 long long pgagroal_fd_generation = 0;
@@ -86,9 +104,9 @@ pgagroal_get_connection(char* username, char* database, bool reuse, bool transac
    time_t start_time;
    int best_rule;
    int retries;
-   long retry_delay;
    int ret;
    char* real_database;
+   struct timespec block_deadline;
 
    struct main_configuration* config;
    struct main_prometheus* prometheus;
@@ -100,8 +118,16 @@ pgagroal_get_connection(char* username, char* database, bool reuse, bool transac
 
    best_rule = find_best_rule(username, database);
    retries = 0;
-   retry_delay = 0; /* seeds the back-off at 1ms on the first blocking retry; persists across goto start */
    start_time = time(NULL);
+
+   /* Absolute deadline for the blocking wait: blocking_timeout after
+    * entry. It is enforced by sem_timedwait (see wait_for_pool_change),
+    * replacing the former polling deadline check. */
+   if (pgagroal_time_is_valid(config->blocking_timeout))
+   {
+      clock_gettime(CLOCK_REALTIME, &block_deadline);
+      block_deadline.tv_sec += pgagroal_time_convert(config->blocking_timeout, FORMAT_TIME_S);
+   }
    pgagroal_prometheus_connection_awaiting(best_rule);
 
 start:
@@ -110,6 +136,9 @@ start:
    *ssl = NULL;
    do_init = false;
    has_lock = false;
+
+   int attempts = 0;
+   int idx;
 
    /* Fast-path bail when the pool is likely saturated. The counter is
     * read non-mutating; the slot array (below) is the source of truth.
@@ -124,21 +153,30 @@ start:
 
    if (reuse)
    {
-      for (int i = 0; *slot == -1 && i < config->max_connections; i++)
+      /* Take candidates from the free-slot ring (O(1) per candidate)
+       * instead of scanning the states[] array. The ring is FIFO, so the
+       * least recently returned matching connection is served first.
+       * Non-matching entries are re-queued; stale entries (the slot left
+       * STATE_FREE after it was queued) are dropped, or re-queued when the
+       * slot is back in STATE_FREE. The attempt bound keeps the pass
+       * finite because re-queued entries reappear at the tail. */
+      while (*slot == -1 && attempts < config->max_connections && pop_free_slot(config, &idx))
       {
          free = STATE_FREE;
 
-         if (atomic_compare_exchange_strong(&config->states[i], &free, STATE_IN_USE))
+         attempts++;
+
+         if (atomic_compare_exchange_strong(&config->states[idx], &free, STATE_IN_USE))
          {
             bool can_reuse = false;
 
             // Check if same rule and username
-            if (best_rule == config->connections[i].limit_rule &&
-                pgagroal_strcmp((const char*)(&config->connections[i].username), username))
+            if (best_rule == config->connections[idx].limit_rule &&
+                pgagroal_strcmp((const char*)(&config->connections[idx].username), username))
             {
                real_database = resolve_database_name(database, best_rule);
                // Check exact database match
-               if (pgagroal_strcmp((const char*)(&config->connections[i].database), real_database))
+               if (pgagroal_strcmp((const char*)(&config->connections[idx].database), real_database))
                {
                   can_reuse = true;
                }
@@ -146,7 +184,7 @@ start:
             }
 
             /* We don't hold the descriptor if main received it after we were forked */
-            if (can_reuse && !transaction_mode && !holds_descriptor(i) && !fetch_descriptor(i))
+            if (can_reuse && !transaction_mode && !holds_descriptor(idx) && !fetch_descriptor(idx))
             {
                can_reuse = false;
             }
@@ -155,19 +193,25 @@ start:
             {
                if (increase_connections(best_rule))
                {
-                  *slot = i;
+                  *slot = idx;
                   has_lock = true;
                }
                else
                {
-                  atomic_store(&config->states[i], STATE_FREE);
+                  slot_mark_free(idx, false);
                   goto retry;
                }
             }
             else
             {
-               atomic_store(&config->states[i], STATE_FREE);
+               slot_mark_free(idx, false);
             }
+         }
+         else if (atomic_load(&config->states[idx]) == STATE_FREE)
+         {
+            /* Stale entry, but the slot is free again: our pop may have
+             * consumed the only queued entry, so re-advertise it */
+            requeue_free_slot(config, idx);
          }
       }
    }
@@ -193,21 +237,23 @@ start:
       }
 
       /* Ok, try and create a new connection */
-      for (int i = 0; *slot == -1 && i < config->max_connections; i++)
+      while (*slot == -1 && attempts < config->max_connections && pop_notinit_slot(config, &idx))
       {
          not_init = STATE_NOTINIT;
 
-         if (atomic_compare_exchange_strong(&config->states[i], &not_init, STATE_INIT))
+         attempts++;
+
+         if (atomic_compare_exchange_strong(&config->states[idx], &not_init, STATE_INIT))
          {
             if (increase_connections(best_rule))
             {
-               *slot = i;
+               *slot = idx;
                do_init = true;
                has_lock = true;
             }
             else
             {
-               atomic_store(&config->states[i], STATE_NOTINIT);
+               slot_mark_notinit(idx, false);
                /* The global max_connections gate lost the race after we had
                 * already reserved a backend against the per-rule max_size cap
                 * (#848). Release that reservation here; the retry: label only
@@ -219,6 +265,12 @@ start:
                }
                goto retry;
             }
+         }
+         else if (atomic_load(&config->states[idx]) == STATE_NOTINIT)
+         {
+            /* Stale entry, but the slot is not initialized again: our pop
+             * may have consumed the only queued entry, so re-advertise it */
+            requeue_notinit_slot(config, idx);
          }
       }
 
@@ -235,6 +287,9 @@ start:
    {
       config->connections[*slot].limit_rule = best_rule;
       config->connections[*slot].pid = getpid();
+      /* We now own the checkout counters (increase_connections above);
+       * re-arm the release guard for this acquisition */
+      atomic_store(&config->connections[*slot].active_released, false);
 
       if (do_init)
       {
@@ -248,7 +303,7 @@ start:
             }
             config->connections[*slot].limit_rule = -1;
             config->connections[*slot].pid = -1;
-            atomic_store(&config->states[*slot], STATE_NOTINIT);
+            slot_mark_notinit(*slot, true);
 
             if (!fork())
             {
@@ -284,7 +339,7 @@ start:
             }
             config->connections[*slot].limit_rule = -1;
             config->connections[*slot].pid = -1;
-            atomic_store(&config->states[*slot], STATE_NOTINIT);
+            slot_mark_notinit(*slot, true);
 
             pgagroal_prometheus_server_error(server);
 
@@ -317,6 +372,10 @@ start:
          config->connections[*slot].has_security = SECURITY_INVALID;
          config->connections[*slot].fd = fd;
 
+         /* The backend is now live: its reservation is released by kill
+          * (guarded by backend_released), not by the return path */
+         atomic_store(&config->connections[*slot].backend_released, false);
+
          atomic_store(&config->states[*slot], STATE_IN_USE);
       }
       else
@@ -332,7 +391,7 @@ start:
             }
             else
             {
-               atomic_store(&config->states[*slot], STATE_FREE);
+               slot_mark_free(*slot, false);
                goto retry;
             }
          }
@@ -384,24 +443,28 @@ start:
 retry:
       if (has_lock)
       {
-         if (best_rule >= 0)
+         /* Release the checkout counters we own. The guard makes this
+          * exclusive with a concurrent kill_connection (e.g. a flush kill
+          * racing our error path): whoever exchanges false -> first
+          * releases; the other skips. */
+         if (!atomic_exchange(&config->connections[*slot].active_released, true))
          {
-            atomic_fetch_sub(&config->limits[best_rule].active_connections, 1);
+            if (best_rule >= 0)
+            {
+               atomic_fetch_sub(&config->limits[best_rule].active_connections, 1);
+            }
+            atomic_fetch_sub(&config->active_connections, 1);
          }
-         atomic_fetch_sub(&config->active_connections, 1);
       }
 retry2:
       if (pgagroal_time_is_valid(config->blocking_timeout))
       {
-         /* Back-off that doubles each retry (1ms, 2ms, 4ms, ... up to the
-          * connection_retry_delay cap), in place of the former fixed 500ms poll.
-          * The total wait is still bounded by blocking_timeout, which is
-          * re-checked below each retry (#813). */
-         retry_delay = pgagroal_pool_next_retry_delay(retry_delay, config->connection_retry_delay);
-         SLEEP(retry_delay)
-
-         double diff = difftime(time(NULL), start_time);
-         if (diff >= (double)pgagroal_time_convert(config->blocking_timeout, FORMAT_TIME_S))
+         /* Block on the rule's waiter semaphore instead of polling: the
+          * process sleeps in the kernel with zero CPU usage until a slot
+          * is released (sem_post from return/kill/rollback), the defensive
+          * re-check slice expires, or the blocking_timeout deadline passes
+          * (#813). */
+         if (!wait_for_pool_change(config, best_rule, &block_deadline))
          {
             goto timeout;
          }
@@ -438,9 +501,12 @@ retry2:
             }
          }
          else
-         /* Sleep for 1000 nanos */
+         /* Block on the waiter semaphore (was: a 1us busy-spin). There is
+          * no deadline, so the wait loops until a matching slot shows up,
+          * exactly like the former spin loop did. */
          {
-            SLEEP_AND_GOTO(1000L, start)
+            wait_for_pool_change(config, best_rule, NULL);
+            goto start;
          }
       }
    }
@@ -456,11 +522,18 @@ timeout:
    return 1;
 
 error:
-   if (best_rule >= 0)
+   if (has_lock)
    {
-      atomic_fetch_sub(&config->limits[best_rule].active_connections, 1);
+      /* Same exclusive release as retry: */
+      if (!atomic_exchange(&config->connections[*slot].active_released, true))
+      {
+         if (best_rule >= 0)
+         {
+            atomic_fetch_sub(&config->limits[best_rule].active_connections, 1);
+         }
+         atomic_fetch_sub(&config->active_connections, 1);
+      }
    }
-   atomic_fetch_sub(&config->active_connections, 1);
    if (config->common.metrics > 0)
    {
       atomic_store(&prometheus->client_wait_time, difftime(time(NULL), start_time));
@@ -470,42 +543,6 @@ error:
    pgagroal_tracking_event_basic(TRACKER_GET_CONNECTION_ERROR, username, database);
 
    return 2;
-}
-
-long
-pgagroal_pool_next_retry_delay(long current_ns, int cap_ms)
-{
-   long cap_ns;
-   long next;
-
-   /* Keep the helper total even if handed an out-of-range cap; configuration
-    * validation is the primary guard, this is defence in depth. */
-   if (cap_ms < MIN_CONNECTION_RETRY_DELAY)
-   {
-      cap_ms = MIN_CONNECTION_RETRY_DELAY;
-   }
-   else if (cap_ms > MAX_CONNECTION_RETRY_DELAY)
-   {
-      cap_ms = MAX_CONNECTION_RETRY_DELAY;
-   }
-
-   cap_ns = (long)cap_ms * 1000000L;
-
-   if (current_ns <= 0)
-   {
-      next = 1000000L; /* 1ms seed */
-   }
-   else
-   {
-      next = current_ns * 2;
-   }
-
-   if (next > cap_ns)
-   {
-      next = cap_ns;
-   }
-
-   return next;
 }
 
 int
@@ -660,7 +697,12 @@ pgagroal_return_connection(int slot, SSL* ssl, bool transaction_mode)
          pgagroal_disconnect(transfer_fd);
          transfer_fd = -1;
 
-         if (config->connections[slot].limit_rule >= 0)
+         /* Release the checkout counters. The guard makes this exclusive
+          * with a concurrent kill_connection of the same slot (flush/management
+          * kill racing the worker's return): exactly one of them decrements. */
+         bool release = !atomic_exchange(&config->connections[slot].active_released, true);
+
+         if (release && config->connections[slot].limit_rule >= 0)
          {
             atomic_fetch_sub(&config->limits[config->connections[slot].limit_rule].active_connections, 1);
          }
@@ -669,8 +711,11 @@ pgagroal_return_connection(int slot, SSL* ssl, bool transaction_mode)
          config->connections[slot].pid = -1;
          config->connections[slot].tx_mode = transaction_mode;
          memset(&config->connections[slot].appname, 0, sizeof(config->connections[slot].appname));
-         atomic_store(&config->states[slot], STATE_FREE);
-         atomic_fetch_sub(&config->active_connections, 1);
+         slot_mark_free(slot, true);
+         if (release)
+         {
+            atomic_fetch_sub(&config->active_connections, 1);
+         }
 
          pgagroal_log_debug("Connection returned: slot=%d, active_connections=%d, gracefully=%s",
                             slot, atomic_load(&config->active_connections), config->gracefully ? "true" : "false");
@@ -789,21 +834,31 @@ pgagroal_kill_connection(int slot, SSL* ssl)
        * backends rather than checkouts, so it must be released on every kill
        * of a rule-bound backend -- including idle/flush kills of pooled
        * connections, where pid == -1 and the checkout counter was already
-       * decremented on return. */
-      atomic_fetch_sub(&config->limits[config->connections[slot].limit_rule].backend_connections, 1);
+       * decremented on return.
+       *
+       * The backend_released guard makes the release exclusive when several
+       * processes kill the same slot concurrently (flush kill vs. the
+       * SIGQUIT'd worker's own kill_connection): exactly one decrements. */
+      if (!atomic_exchange(&config->connections[slot].backend_released, true))
+      {
+         atomic_fetch_sub(&config->limits[config->connections[slot].limit_rule].backend_connections, 1);
+      }
    }
 
-   if (config->connections[slot].pid != -1)
+   if (!atomic_exchange(&config->connections[slot].active_released, true))
    {
-      if (config->connections[slot].limit_rule >= 0)
+      if (config->connections[slot].pid != -1)
       {
-         atomic_fetch_sub(&config->limits[config->connections[slot].limit_rule].active_connections, 1);
+         if (config->connections[slot].limit_rule >= 0)
+         {
+            atomic_fetch_sub(&config->limits[config->connections[slot].limit_rule].active_connections, 1);
+         }
+
+         atomic_fetch_sub(&config->active_connections, 1);
+
+         // Check for graceful shutdown after killing connection
+         check_graceful_shutdown_trigger();
       }
-
-      atomic_fetch_sub(&config->active_connections, 1);
-
-      // Check for graceful shutdown after killing connection
-      check_graceful_shutdown_trigger();
    }
 
    memset(&config->connections[slot].username, 0, sizeof(config->connections[slot].username));
@@ -836,7 +891,7 @@ pgagroal_kill_connection(int slot, SSL* ssl)
    config->connections[slot].pid = -1;
    atomic_store(&config->connections[slot].generation, 0);
 
-   atomic_store(&config->states[slot], STATE_NOTINIT);
+   slot_mark_notinit(slot, true);
 
    pgagroal_prometheus_connection_kill();
 
@@ -890,7 +945,7 @@ pgagroal_idle_timeout(void)
       {
          if (!holds_descriptor(i))
          {
-            atomic_store(&config->states[i], STATE_FREE);
+            slot_mark_free(i, false);
             continue;
          }
 
@@ -910,6 +965,11 @@ pgagroal_idle_timeout(void)
                pgagroal_tracking_event_slot(TRACKER_IDLE_TIMEOUT, i);
                pgagroal_kill_connection(i, NULL);
                prefill = true;
+            }
+            else
+            {
+               /* The slot is back in STATE_FREE: make sure it is queued */
+               slot_mark_free(i, false);
             }
          }
       }
@@ -955,7 +1015,7 @@ pgagroal_max_connection_age(void)
       {
          if (!holds_descriptor(i))
          {
-            atomic_store(&config->states[i], STATE_FREE);
+            slot_mark_free(i, false);
             continue;
          }
 
@@ -975,6 +1035,11 @@ pgagroal_max_connection_age(void)
                pgagroal_tracking_event_slot(TRACKER_MAX_CONNECTION_AGE, i);
                pgagroal_kill_connection(i, NULL);
                prefill = true;
+            }
+            else
+            {
+               /* The slot is back in STATE_FREE: make sure it is queued */
+               slot_mark_free(i, false);
             }
          }
       }
@@ -1019,7 +1084,7 @@ pgagroal_validation(void)
       {
          if (!holds_descriptor(i))
          {
-            atomic_store(&config->states[i], STATE_FREE);
+            slot_mark_free(i, false);
             continue;
          }
 
@@ -1073,6 +1138,11 @@ pgagroal_validation(void)
                pgagroal_tracking_event_slot(TRACKER_INVALID_CONNECTION, i);
                pgagroal_kill_connection(i, NULL);
                prefill = true;
+            }
+            else
+            {
+               /* The slot is back in STATE_FREE: make sure it is queued */
+               slot_mark_free(i, false);
             }
          }
       }
@@ -1138,7 +1208,7 @@ pgagroal_flush(int mode, char* database)
             {
                if (!holds_descriptor(i))
                {
-                  atomic_store(&config->states[i], STATE_FREE);
+                  slot_mark_free(i, false);
                   continue;
                }
 
@@ -1472,6 +1542,39 @@ pgagroal_pool_init(void)
       atomic_init(&config->states[i], STATE_NOTINIT);
    }
 
+   /* Slot index queues. Both live in the shared memory segment and are
+    * initialized exactly once here, before any worker process is forked;
+    * a configuration reload must never re-initialize them. */
+   pgagroal_queue_init(&config->free_slots);
+   pgagroal_queue_init(&config->notinit_slots);
+
+   for (int i = 0; i < config->max_connections; i++)
+   {
+      atomic_init(&config->free_queued[i], 0);
+      atomic_init(&config->notinit_queued[i], 0);
+
+      /* Every slot starts as STATE_NOTINIT: seed the notinit ring so the
+       * new-connection path can find candidates without a scan */
+      atomic_store(&config->notinit_queued[i], 1);
+      pgagroal_queue_push(&config->notinit_slots, i);
+   }
+
+   /* Waiter semaphores: process-shared (pshared = 1), one per limit rule
+    * plus one for requests without a matching rule. All NUMBER_OF_LIMITS
+    * semaphores are initialized so that a reload which activates more
+    * rules finds them ready. */
+   for (int i = 0; i < NUMBER_OF_LIMITS; i++)
+   {
+      if (sem_init(&config->limit_sems[i], 1, 0))
+      {
+         pgagroal_log_error("pgagroal_pool_init: sem_init(limit_sems[%d]) failed (%s)", i, strerror(errno));
+      }
+   }
+   if (sem_init(&config->no_limit_sem, 1, 0))
+   {
+      pgagroal_log_error("pgagroal_pool_init: sem_init(no_limit_sem) failed (%s)", strerror(errno));
+   }
+
    /* Connections */
    for (int i = 0; i < config->max_connections; i++)
    {
@@ -1485,6 +1588,9 @@ pgagroal_pool_init(void)
       config->connections[i].timestamp = -1;
       config->connections[i].fd = -1;
       config->connections[i].pid = -1;
+      /* No counters are outstanding for a fresh slot */
+      atomic_init(&config->connections[i].active_released, true);
+      atomic_init(&config->connections[i].backend_released, true);
       atomic_store(&config->connections[i].generation, 0);
    }
 
@@ -1518,7 +1624,7 @@ pgagroal_pool_shutdown(void)
             kill(config->connections[i].pid, SIGQUIT);
          }
 
-         atomic_store(&config->states[i], STATE_NOTINIT);
+         slot_mark_notinit(i, false);
       }
    }
 
@@ -1533,6 +1639,9 @@ pgagroal_pool_status(void)
    config = (struct main_configuration*)shmem;
 
    pgagroal_log_debug("pgagroal_pool_status: %d/%d", atomic_load(&config->active_connections), config->max_connections);
+   pgagroal_log_debug("pgagroal_pool_status: free ring %u, notinit ring %u",
+                      pgagroal_queue_size(&config->free_slots),
+                      pgagroal_queue_size(&config->notinit_slots));
 
    for (int i = 0; i < config->max_connections; i++)
    {
@@ -1728,6 +1837,8 @@ get_connection_count_for_limit_rule(int rule_index, char* username)
 static bool
 remove_connection(char* username, char* database)
 {
+   int attempts;
+   int idx;
    signed char free;
    signed char remove;
    struct main_configuration* config;
@@ -1735,36 +1846,58 @@ remove_connection(char* username, char* database)
    config = (struct main_configuration*)shmem;
 
    pgagroal_log_trace("remove_connection");
-   for (int i = config->max_connections - 1; i >= 0; i--)
+
+   /* Pull candidates from the free-slot ring instead of scanning the
+    * states[] array. FIFO order evicts the least recently returned
+    * connection. Candidates matching the requester are put back and
+    * reported (the caller retries and can then reuse them); stale
+    * entries (the slot left STATE_FREE after it was queued) are dropped,
+    * or re-queued when the slot is back in STATE_FREE. The attempt bound
+    * keeps the loop finite because re-queued entries reappear at the
+    * tail. */
+   attempts = 0;
+
+   while (attempts < config->max_connections && pop_free_slot(config, &idx))
    {
+      attempts++;
       free = STATE_FREE;
       remove = STATE_REMOVE;
 
-      if (atomic_compare_exchange_strong(&config->states[i], &free, remove))
+      if (atomic_compare_exchange_strong(&config->states[idx], &free, remove))
       {
-         if (!holds_descriptor(i))
+         if (!holds_descriptor(idx))
          {
-            atomic_store(&config->states[i], STATE_FREE);
+            slot_mark_free(idx, false);
             continue;
          }
 
-         if (pgagroal_strcmp(username, config->connections[i].username) && pgagroal_strcmp(database, config->connections[i].database))
+         if (pgagroal_strcmp(username, config->connections[idx].username) && pgagroal_strcmp(database, config->connections[idx].database))
          {
-            if (!atomic_compare_exchange_strong(&config->states[i], &remove, STATE_FREE))
+            if (!atomic_compare_exchange_strong(&config->states[idx], &remove, STATE_FREE))
             {
                pgagroal_prometheus_connection_remove();
-               pgagroal_tracking_event_slot(TRACKER_REMOVE_CONNECTION, i);
-               pgagroal_kill_connection(i, NULL);
+               pgagroal_tracking_event_slot(TRACKER_REMOVE_CONNECTION, idx);
+               pgagroal_kill_connection(idx, NULL);
+            }
+            else
+            {
+               slot_mark_free(idx, false);
             }
          }
          else
          {
             pgagroal_prometheus_connection_remove();
-            pgagroal_tracking_event_slot(TRACKER_REMOVE_CONNECTION, i);
-            pgagroal_kill_connection(i, NULL);
+            pgagroal_tracking_event_slot(TRACKER_REMOVE_CONNECTION, idx);
+            pgagroal_kill_connection(idx, NULL);
          }
 
          return true;
+      }
+      else if (atomic_load(&config->states[idx]) == STATE_FREE)
+      {
+         /* Stale entry, but the slot is free again: our pop may have
+          * consumed the only queued entry, so re-advertise it */
+         requeue_free_slot(config, idx);
       }
    }
 
@@ -2227,4 +2360,223 @@ holds_descriptor(int slot)
 
    /* connections[slot].fd is ours only if main received it before we were forked */
    return atomic_load(&config->connections[slot].generation) <= pgagroal_fd_generation;
+}
+
+static bool
+pop_free_slot(struct main_configuration* config, int* slot)
+{
+   if (!pgagroal_queue_pop(&config->free_slots, slot))
+   {
+      return false;
+   }
+
+   /* Clear the dedup flag as soon as the entry is out of the ring and
+    * before the state CAS: any concurrent transition into STATE_FREE must
+    * enqueue a fresh entry rather than assume ours is still queued. */
+   atomic_store(&config->free_queued[*slot], 0);
+
+   return true;
+}
+
+static bool
+pop_notinit_slot(struct main_configuration* config, int* slot)
+{
+   if (!pgagroal_queue_pop(&config->notinit_slots, slot))
+   {
+      return false;
+   }
+
+   atomic_store(&config->notinit_queued[*slot], 0);
+
+   return true;
+}
+
+static void
+requeue_free_slot(struct main_configuration* config, int slot)
+{
+   /* Re-advertise a slot whose ring entry we consumed but could not use.
+    * The exchange guard keeps the one-entry-per-slot invariant: if a
+    * producer queued a fresh entry concurrently, it wins the exchange and
+    * we skip. */
+   if (atomic_exchange(&config->free_queued[slot], 1) == 0)
+   {
+      if (!pgagroal_queue_push(&config->free_slots, slot))
+      {
+         atomic_store(&config->free_queued[slot], 0);
+         pgagroal_log_error("requeue_free_slot: free_slots queue full (slot %d)", slot);
+      }
+   }
+}
+
+static void
+requeue_notinit_slot(struct main_configuration* config, int slot)
+{
+   if (atomic_exchange(&config->notinit_queued[slot], 1) == 0)
+   {
+      if (!pgagroal_queue_push(&config->notinit_slots, slot))
+      {
+         atomic_store(&config->notinit_queued[slot], 0);
+         pgagroal_log_error("requeue_notinit_slot: notinit_slots queue full (slot %d)", slot);
+      }
+   }
+}
+
+static void
+slot_mark_free(int slot, bool wake)
+{
+   struct main_configuration* config = (struct main_configuration*)shmem;
+
+   atomic_store(&config->states[slot], STATE_FREE);
+
+   /* Enqueue the candidate for acquirers. The dedup flag guarantees at
+    * most one queued entry per slot: push only when the flag exchanged
+    * 0 -> 1. If an entry is already queued (housekeeping briefly moved
+    * the slot out of STATE_FREE and back), the existing entry stands. */
+   if (atomic_exchange(&config->free_queued[slot], 1) == 0)
+   {
+      if (!pgagroal_queue_push(&config->free_slots, slot))
+      {
+         /* Cannot happen: capacity >= MAX_NUMBER_OF_CONNECTIONS and at
+          * most one entry per slot. Recover defensively so the slot is
+          * not lost. */
+         atomic_store(&config->free_queued[slot], 0);
+         pgagroal_log_error("slot_mark_free: free_slots queue full (slot %d)", slot);
+      }
+   }
+
+   if (wake)
+   {
+      wake_waiters(slot, true);
+   }
+}
+
+static void
+slot_mark_notinit(int slot, bool wake)
+{
+   struct main_configuration* config = (struct main_configuration*)shmem;
+
+   atomic_store(&config->states[slot], STATE_NOTINIT);
+
+   if (atomic_exchange(&config->notinit_queued[slot], 1) == 0)
+   {
+      if (!pgagroal_queue_push(&config->notinit_slots, slot))
+      {
+         atomic_store(&config->notinit_queued[slot], 0);
+         pgagroal_log_error("slot_mark_notinit: notinit_slots queue full (slot %d)", slot);
+      }
+   }
+
+   if (wake)
+   {
+      wake_waiters(slot, false);
+   }
+}
+
+static void
+wake_waiters(int slot, bool is_free)
+{
+   char* username;
+   char* database;
+   struct main_configuration* config = (struct main_configuration*)shmem;
+
+   if (!is_free)
+   {
+      /* A killed (STATE_NOTINIT) slot can be turned into a new connection
+       * by any rule, so every waiter is eligible. Waking a waiter whose
+       * rule is still saturated is harmless: it re-checks and blocks
+       * again (one futex wake at most). */
+      for (int i = 0; i < config->number_of_limits; i++)
+      {
+         sem_post(&config->limit_sems[i]);
+      }
+      sem_post(&config->no_limit_sem);
+      return;
+   }
+
+   /* A returned (STATE_FREE) connection can only be reused by a request
+    * whose user/database the connection matches (the reuse path), so only
+    * the rules whose pattern matches the returned connection are woken.
+    * Note: this must not read connections[slot] on the kill path -- there
+    * the fields are already cleared -- which is why the kill path returns
+    * above. */
+   username = (char*)&config->connections[slot].username;
+   database = (char*)&config->connections[slot].database;
+
+   for (int i = 0; i < config->number_of_limits; i++)
+   {
+      if ((pgagroal_strcmp("all", config->limits[i].username) || pgagroal_strcmp(username, config->limits[i].username)) &&
+          (pgagroal_strcmp("all", config->limits[i].database) || pgagroal_strcmp(database, config->limits[i].database)))
+      {
+         sem_post(&config->limit_sems[i]);
+      }
+   }
+
+   sem_post(&config->no_limit_sem);
+}
+
+static void
+timespec_add_ns(struct timespec* ts, long ns)
+{
+   ts->tv_nsec += ns;
+   while (ts->tv_nsec >= 1000000000L)
+   {
+      ts->tv_nsec -= 1000000000L;
+      ts->tv_sec += 1;
+   }
+}
+
+static bool
+timespec_less(struct timespec* a, struct timespec* b)
+{
+   if (a->tv_sec != b->tv_sec)
+   {
+      return a->tv_sec < b->tv_sec;
+   }
+   return a->tv_nsec < b->tv_nsec;
+}
+
+static bool
+wait_for_pool_change(struct main_configuration* config, int best_rule, struct timespec* deadline)
+{
+   struct timespec now;
+   struct timespec wake_up;
+   sem_t* sem;
+   int rc;
+
+   /* Wait on the semaphore of the request's rule (or the global one when
+    * no rule matched). Producers post on every availability event, so a
+    * wakeup means the pool may have changed and the acquisition pass is
+    * retried. */
+   sem = (best_rule >= 0) ? &config->limit_sems[best_rule] : &config->no_limit_sem;
+
+   clock_gettime(CLOCK_REALTIME, &now);
+   wake_up = now;
+   timespec_add_ns(&wake_up, POOL_WAIT_SLICE_NS);
+
+   /* Never sleep past the acquisition deadline */
+   if (deadline != NULL && timespec_less(deadline, &wake_up))
+   {
+      wake_up = *deadline;
+   }
+
+   rc = sem_timedwait(sem, &wake_up);
+   if (rc == 0)
+   {
+      /* Woken by a producer (or a stale wakeup credit was available) */
+      return true;
+   }
+
+   if (deadline != NULL)
+   {
+      clock_gettime(CLOCK_REALTIME, &now);
+      if (timespec_less(deadline, &now))
+      {
+         /* The blocking_timeout deadline has passed */
+         return false;
+      }
+   }
+
+   /* The slice expired (or the call was interrupted): re-run the
+    * acquisition pass, which also covers entries that raced in flight. */
+   return true;
 }
