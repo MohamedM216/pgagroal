@@ -76,16 +76,21 @@ static void requeue_notinit_slot(struct main_configuration* config, int slot);
 static void slot_mark_free(int slot, bool wake);
 static void slot_mark_notinit(int slot, bool wake);
 static void wake_waiters(int slot, bool is_free);
-static bool wait_for_pool_change(struct main_configuration* config, int best_rule, struct timespec* deadline);
+static bool wait_for_pool_change(struct main_configuration* config, int best_rule, struct timespec* deadline, long* retry_delay);
 static void timespec_add_ns(struct timespec* ts, long ns);
 static bool timespec_less(struct timespec* a, struct timespec* b);
 
-/* Defensive re-check slice for the blocking wait. Producers post on every
- * availability event, but a waiter can race with an in-flight ring entry
- * (popped by another process, not yet re-queued); the slice bounds the
- * worst-case re-check latency while still sleeping in the kernel with
- * zero CPU usage between wakes. */
-#define POOL_WAIT_SLICE_NS 50000000L /* 50ms */
+/* The blocking wait re-checks the pool with the same exponential back-off
+ * the former polling loop used (1ms seed, doubling, capped at
+ * connection_retry_delay, default 250ms). Producers wake a waiter on every
+ * availability event, so the slice only bounds the cost of the rare
+ * missed-signal window; keeping the re-check cadence identical to the
+ * upstream polling loop preserves the kernel-side wakeup budget of
+ * O(waiters / connection_retry_delay) wakes per second. A short fixed
+ * slice (e.g. 50ms) raises that budget 5x per waiter: with thousands of
+ * waiting workers the resulting futex/timer storm starves the main
+ * process of CPU (accept/fork/descriptor IPC) and throughput regresses,
+ * which is exactly what the oversubscription benchmark measured. */
 
 int pgagroal_known_fds[MAX_NUMBER_OF_CONNECTIONS];
 long long pgagroal_fd_generation = 0;
@@ -104,6 +109,7 @@ pgagroal_get_connection(char* username, char* database, bool reuse, bool transac
    time_t start_time;
    int best_rule;
    int retries;
+   long retry_delay;
    int ret;
    char* real_database;
    struct timespec block_deadline;
@@ -118,6 +124,7 @@ pgagroal_get_connection(char* username, char* database, bool reuse, bool transac
 
    best_rule = find_best_rule(username, database);
    retries = 0;
+   retry_delay = 0; /* seeds the blocking-wait slice at 1ms; persists across goto start */
    start_time = time(NULL);
 
    /* Absolute deadline for the blocking wait: blocking_timeout after
@@ -463,8 +470,11 @@ retry2:
           * polling: the process sleeps in the kernel with zero CPU usage
           * until a slot is released (pgagroal_wait_group_notify from
           * return/kill/rollback), the defensive re-check slice expires,
-          * or the blocking_timeout deadline passes (#813). */
-         if (!wait_for_pool_change(config, best_rule, &block_deadline))
+          * or the blocking_timeout deadline passes (#813). The slice
+          * follows the same exponential back-off as the former polling
+          * loop (see next_retry_delay) so the wakeup budget matches
+          * upstream at high waiter counts. */
+         if (!wait_for_pool_change(config, best_rule, &block_deadline, &retry_delay))
          {
             goto timeout;
          }
@@ -501,11 +511,12 @@ retry2:
             }
          }
          else
-         /* Block on the waiter semaphore (was: a 1us busy-spin). There is
-          * no deadline, so the wait loops until a matching slot shows up,
-          * exactly like the former spin loop did. */
+         /* Block on the waiter notification group (was: a 1us busy-spin).
+          * There is no deadline, so the wait loops until a matching slot
+          * shows up, exactly like the former spin loop did; the slice
+          * backs off exactly like the blocking_timeout path above. */
          {
-            wait_for_pool_change(config, best_rule, NULL);
+            wait_for_pool_change(config, best_rule, NULL, &retry_delay);
             goto start;
          }
       }
@@ -543,6 +554,42 @@ error:
    pgagroal_tracking_event_basic(TRACKER_GET_CONNECTION_ERROR, username, database);
 
    return 2;
+}
+
+long
+pgagroal_pool_next_retry_delay(long current_ns, int cap_ms)
+{
+   long cap_ns;
+   long next;
+
+   /* Keep the helper total even if handed an out-of-range cap; configuration
+    * validation is the primary guard, this is defence in depth. */
+   if (cap_ms < MIN_CONNECTION_RETRY_DELAY)
+   {
+      cap_ms = MIN_CONNECTION_RETRY_DELAY;
+   }
+   else if (cap_ms > MAX_CONNECTION_RETRY_DELAY)
+   {
+      cap_ms = MAX_CONNECTION_RETRY_DELAY;
+   }
+
+   cap_ns = (long)cap_ms * 1000000L;
+
+   if (current_ns <= 0)
+   {
+      next = 1000000L; /* 1ms seed */
+   }
+   else
+   {
+      next = current_ns * 2;
+   }
+
+   if (next > cap_ns)
+   {
+      next = cap_ns;
+   }
+
+   return next;
 }
 
 int
@@ -711,11 +758,18 @@ pgagroal_return_connection(int slot, SSL* ssl, bool transaction_mode)
          config->connections[slot].pid = -1;
          config->connections[slot].tx_mode = transaction_mode;
          memset(&config->connections[slot].appname, 0, sizeof(config->connections[slot].appname));
-         slot_mark_free(slot, true);
+         /* Release the checkout counter BEFORE marking the slot free:
+          * slot_mark_free wakes one waiter, and that waiter's acquisition
+          * pass starts with the active_connections saturation check. If
+          * the wake precedes the decrement, the woken waiter can observe
+          * the counter still at max_connections, skip the free-slot ring,
+          * and go back to sleep -- wasting the only wake this return
+          * earned and idling the slot until the next return. */
          if (release)
          {
             atomic_fetch_sub(&config->active_connections, 1);
          }
+         slot_mark_free(slot, true);
 
          pgagroal_log_debug("Connection returned: slot=%d, active_connections=%d, gracefully=%s",
                             slot, atomic_load(&config->active_connections), config->gracefully ? "true" : "false");
@@ -2580,11 +2634,12 @@ timespec_less(struct timespec* a, struct timespec* b)
 }
 
 static bool
-wait_for_pool_change(struct main_configuration* config, int best_rule, struct timespec* deadline)
+wait_for_pool_change(struct main_configuration* config, int best_rule, struct timespec* deadline, long* retry_delay)
 {
    struct pgagroal_wait_group* group;
    struct timespec now;
    struct timespec wake_up;
+   long slice;
    int rc;
 
    /* Wait on the notification group of the request's rule (or the global
@@ -2593,9 +2648,19 @@ wait_for_pool_change(struct main_configuration* config, int best_rule, struct ti
     * acquisition pass is retried. */
    group = (best_rule >= 0) ? &config->limit_waits[best_rule] : &config->no_limit_wait;
 
+   /* Exponential back-off for the defensive re-check slice (1ms seed,
+    * doubling, capped at connection_retry_delay). Signals are the primary
+    * wakeup path; the slice only covers the rare missed-signal window, so
+    * it must stay as cheap as the upstream polling loop it replaced --
+    * a fixed short slice multiplies the kernel wakeup budget by the
+    * waiter count and starves the rest of the system under heavy
+    * oversubscription. */
+   slice = pgagroal_pool_next_retry_delay(*retry_delay, config->connection_retry_delay);
+   *retry_delay = slice;
+
    clock_gettime(CLOCK_REALTIME, &now);
    wake_up = now;
-   timespec_add_ns(&wake_up, POOL_WAIT_SLICE_NS);
+   timespec_add_ns(&wake_up, slice);
 
    /* Never sleep past the acquisition deadline */
    if (deadline != NULL && timespec_less(deadline, &wake_up))
