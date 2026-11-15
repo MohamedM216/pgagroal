@@ -769,16 +769,63 @@ struct pgagroal_slot_queue
    struct pgagroal_queue_cell cells[SLOT_QUEUE_CAPACITY];     /**< The ring cells */
 };
 
-/** @struct pgagroal_wait_group
- * A waiter notification group that lives in the shared memory segment of
- * struct main_configuration: a process-shared pthread mutex guarding a
- * condition variable and the number of processes currently blocked on it.
+/**
+ * @def PGAGROAL_WAITER_TABLE_SIZE
+ * Number of ticket entries per waiter group. Entries carry no per-waiter
+ * condition variable, so the table is small (8 KiB per group at 32 bytes
+ * per entry); requests beyond the table fall back to a generation-based
+ * best-effort wait that is still wakeup-lossless. The bound also caps the
+ * thundering herd of a grant broadcast to this many processes.
+ */
+#define PGAGROAL_WAITER_TABLE_SIZE 256
+
+/** @struct pgagroal_waiter_entry
+ * One registered waiter of a rule group (Queue 2). The entry is the
+ * waiter's FIFO ticket: producers reserve a free slot for the oldest
+ * matching live entry and hand it over by writing granted_slot, so the
+ * woken waiter skips the acquisition race entirely.
  *
- * Used by pgagroal_get_connection() to block instead of polling when the
- * pool is saturated (Queue 2). Producers (pgagroal_return_connection,
- * pgagroal_kill_connection and the error rollbacks) notify the group after
- * making a slot available; a notified waiter re-runs its acquisition pass,
- * whose CAS-based commit on states[slot] remains the correctness guard.
+ * match is a hash over (username, database, limit_rule) - exactly the
+ * triple that the reuse path's can_reuse test requires - so a producer
+ * never spends a hand-off on a waiter that cannot use the slot. Hash
+ * collisions are harmless: the waiter re-validates can_reuse after
+ * waking and re-publishes the slot on a mismatch.
+ */
+struct pgagroal_waiter_entry
+{
+   uint64_t ticket;        /**< FIFO admission order, assigned under the group mutex */
+   uint64_t match;         /**< Hash of (username, database, limit_rule) the waiter can reuse */
+   pid_t    pid;           /**< Waiting worker process, liveness-checked at grant time */
+   int32_t  granted_slot;  /**< -1 pending, >= 0 slot reserved for this waiter */
+   int32_t  next_free;     /**< Freelist chain (index of next free entry) when unused */
+};
+
+/** @struct pgagroal_wait_group
+ * A FIFO waiter group per limit rule (plus one for rule-less requests)
+ * living in the shared memory segment of struct main_configuration.
+ *
+ * Queue 2 of the pool: pgagroal_get_connection() registers a ticket here
+ * when no slot could be acquired, and sleeps. Producers
+ * (pgagroal_return_connection, pgagroal_kill_connection and every error
+ * rollback) publish slots through publish_free_slot()/publish_notinit_slot():
+ *
+ * - a returned (STATE_FREE) slot is reserved, under the group mutex, for
+ *   the oldest live waiter whose match hash equals the slot's, and that
+ *   waiter is woken by name via granted_slot - a direct hand-off with no
+ *   acquisition race, no barging and no lost wakeup (the predicate is
+ *   written and read under the same mutex);
+ * - slots nobody waits for go to the lock-free free-slot ring for the
+ *   unsaturated fast path;
+ * - killed (STATE_NOTINIT) slots serve any rule: they go to the notinit
+ *   ring and wake_gen is bumped so waiting requesters re-run their
+ *   connection-creation pass;
+ * - waiters beyond the ticket table sleep on retry_cond with the
+ *   generation counter as predicate - wakeup-lossless, best-effort order.
+ *
+ * All state guarded by mutex is written and read under the mutex; the
+ * hand-off reservation itself is committed by the atomic store of
+ * STATE_IN_USE on states[slot], which remains the single source of truth
+ * for slot ownership.
  *
  * Process-shared pthread primitives are used instead of unnamed POSIX
  * semaphores (sem_init with pshared = 1) because unnamed semaphores are
@@ -788,9 +835,19 @@ struct pgagroal_slot_queue
  */
 struct pgagroal_wait_group
 {
-   pthread_mutex_t mutex; /**< Process-shared mutex protecting waiters and cond */
-   pthread_cond_t cond;   /**< Process-shared condition variable waiters sleep on */
-   int waiters;           /**< Number of processes currently blocked on cond */
+   pthread_mutex_t mutex;      /**< Process-shared mutex guarding everything below */
+   pthread_cond_t  grant_cond; /**< Ticketed waiters; broadcast on grants and creation events */
+   pthread_cond_t  retry_cond; /**< Overflow waiters; one process signalled per generation bump */
+   uint64_t gen;               /**< Bumped on every event overflow waiters must re-check */
+   uint64_t wake_gen;          /**< Bumped when a creation slot appeared (STATE_NOTINIT publish) */
+   uint64_t next_ticket;       /**< FIFO ticket allocator */
+   int32_t  free_head;         /**< Freelist head of unused entries, -1 when none */
+   int      waiters;            /**< Registered ticketed waiters (entries in use) */
+   int      overflow_waiters;  /**< Waiters sleeping on retry_cond without an entry */
+   int      mono_clock;         /**< 1 when the condvars use CLOCK_MONOTONIC deadlines */
+   int      rt_offset_sec;      /**< realtime - monotonic offset (used when mono_clock = 0, e.g. macOS) */
+   int      rt_offset_nsec;
+   struct pgagroal_waiter_entry entries[PGAGROAL_WAITER_TABLE_SIZE]; /**< The ticket table */
 };
 
 /** @struct main_configuration

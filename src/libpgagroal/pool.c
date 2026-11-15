@@ -73,24 +73,41 @@ static bool pop_free_slot(struct main_configuration* config, int* slot);
 static bool pop_notinit_slot(struct main_configuration* config, int* slot);
 static void requeue_free_slot(struct main_configuration* config, int slot);
 static void requeue_notinit_slot(struct main_configuration* config, int slot);
-static void slot_mark_free(int slot, bool wake);
-static void slot_mark_notinit(int slot, bool wake);
-static void wake_waiters(int slot, bool is_free);
-static bool wait_for_pool_change(struct main_configuration* config, int best_rule, struct timespec* deadline, long* retry_delay);
+static void publish_free_slot(int slot);
+static void publish_notinit_slot(int slot);
+static struct pgagroal_wait_group* group_for_rule(struct main_configuration* config, int best_rule);
+static uint64_t waiter_match_hash(char* username, char* database, int best_rule);
+static uint64_t slot_match_hash(struct main_configuration* config, int slot);
+static bool waiter_alive(const struct pgagroal_waiter_entry* entry);
+static void waiter_recycle(struct pgagroal_wait_group* group, struct pgagroal_waiter_entry* entry);
+static void waiter_gen_signal(struct pgagroal_wait_group* group);
+static void wait_group_abstime(struct pgagroal_wait_group* group, struct timespec* out, struct timespec* mono_deadline);
+static bool mono_deadline_passed(struct timespec* deadline);
+static int wait_for_slot(struct main_configuration* config, int best_rule, char* username, char* database,
+                          struct timespec* deadline, int* slot, int* wait_entry);
+static void waiter_leave(struct main_configuration* config, int best_rule, int wait_entry);
 static void timespec_add_ns(struct timespec* ts, long ns);
 static bool timespec_less(struct timespec* a, struct timespec* b);
 
-/* The blocking wait re-checks the pool with the same exponential back-off
- * the former polling loop used (1ms seed, doubling, capped at
- * connection_retry_delay, default 250ms). Producers wake a waiter on every
- * availability event, so the slice only bounds the cost of the rare
- * missed-signal window; keeping the re-check cadence identical to the
- * upstream polling loop preserves the kernel-side wakeup budget of
- * O(waiters / connection_retry_delay) wakes per second. A short fixed
- * slice (e.g. 50ms) raises that budget 5x per waiter: with thousands of
- * waiting workers the resulting futex/timer storm starves the main
- * process of CPU (accept/fork/descriptor IPC) and throughput regresses,
- * which is exactly what the oversubscription benchmark measured. */
+/* Queue 2, the saturated-pool wait path, is a FIFO ticket group with a
+ * direct slot hand-off: producers (return / kill / every error rollback)
+ * reserve the freed slot for the oldest matching waiter under the group
+ * mutex and wake that waiter by writing its granted_slot, so the woken
+ * process skips the acquisition race entirely. Wakeups are lossless (the
+ * predicate is written and read under the same mutex), the order is
+ * FIFO (tickets), and a fresh arrival cannot barge in front of a queued
+ * waiter because a matching slot never passes through the free-slot ring
+ * while a matching waiter exists.
+ *
+ * A bounded safety slice (connection_retry_delay, default 250ms) remains
+ * as pure defence in depth: it re-runs the acquisition pass (creation
+ * slots, stray STATE_FREE entries) even if a wakeup were ever missed,
+ * without multiplying the kernel wakeup budget the way a short fixed
+ * slice does under massive oversubscription. */
+
+#define WAIT_SLOT_GRANTED 0
+#define WAIT_SLOT_PASS    1
+#define WAIT_SLOT_TIMEOUT 2
 
 int pgagroal_known_fds[MAX_NUMBER_OF_CONNECTIONS];
 long long pgagroal_fd_generation = 0;
@@ -109,7 +126,7 @@ pgagroal_get_connection(char* username, char* database, bool reuse, bool transac
    time_t start_time;
    int best_rule;
    int retries;
-   long retry_delay;
+   int wait_entry;
    int ret;
    char* real_database;
    struct timespec block_deadline;
@@ -124,15 +141,16 @@ pgagroal_get_connection(char* username, char* database, bool reuse, bool transac
 
    best_rule = find_best_rule(username, database);
    retries = 0;
-   retry_delay = 0; /* seeds the blocking-wait slice at 1ms; persists across goto start */
+   wait_entry = -1; /* wait ticket index; -2 = overflow mode; survives goto start */
    start_time = time(NULL);
 
    /* Absolute deadline for the blocking wait: blocking_timeout after
-    * entry. It is enforced by pthread_cond_timedwait (see
-    * wait_for_pool_change), replacing the former polling deadline check. */
+    * entry, measured on CLOCK_MONOTONIC so wall-clock adjustments cannot
+    * shorten or extend it (translated to the condvar's clock in
+    * wait_group_abstime; macOS condvars only measure CLOCK_REALTIME). */
    if (pgagroal_time_is_valid(config->blocking_timeout))
    {
-      clock_gettime(CLOCK_REALTIME, &block_deadline);
+      clock_gettime(CLOCK_MONOTONIC, &block_deadline);
       block_deadline.tv_sec += pgagroal_time_convert(config->blocking_timeout, FORMAT_TIME_S);
    }
    pgagroal_prometheus_connection_awaiting(best_rule);
@@ -205,13 +223,13 @@ start:
                }
                else
                {
-                  slot_mark_free(idx, false);
+                  publish_free_slot(idx);
                   goto retry;
                }
             }
             else
             {
-               slot_mark_free(idx, false);
+               publish_free_slot(idx);
             }
          }
          else if (atomic_load(&config->states[idx]) == STATE_FREE)
@@ -243,6 +261,11 @@ start:
          }
       }
 
+      /* Reset the attempt budget: the reuse pass may have consumed it on
+       * re-queued non-matching candidates, which must not be allowed to
+       * starve the connection-creation pass entirely. */
+      attempts = 0;
+
       /* Ok, try and create a new connection */
       while (*slot == -1 && attempts < config->max_connections && pop_notinit_slot(config, &idx))
       {
@@ -260,7 +283,7 @@ start:
             }
             else
             {
-               slot_mark_notinit(idx, false);
+               publish_notinit_slot(idx);
                /* The global max_connections gate lost the race after we had
                 * already reserved a backend against the per-rule max_size cap
                 * (#848). Release that reservation here; the retry: label only
@@ -292,6 +315,17 @@ start:
 
    if (*slot != -1)
    {
+have:
+      /* A slot was acquired - by the fast path above or by a granted
+       * hand-off from wait_for_slot. Leave the wait queue first: if a
+       * hand-off was reserved for us while the pass ran, forward that
+       * slot to the next waiter instead of losing it. */
+      if (wait_entry != -1)
+      {
+         waiter_leave(config, best_rule, wait_entry);
+         wait_entry = -1;
+      }
+
       config->connections[*slot].limit_rule = best_rule;
       config->connections[*slot].pid = getpid();
       /* We now own the checkout counters (increase_connections above);
@@ -310,7 +344,7 @@ start:
             }
             config->connections[*slot].limit_rule = -1;
             config->connections[*slot].pid = -1;
-            slot_mark_notinit(*slot, true);
+            publish_notinit_slot(*slot);
 
             if (!fork())
             {
@@ -346,7 +380,7 @@ start:
             }
             config->connections[*slot].limit_rule = -1;
             config->connections[*slot].pid = -1;
-            slot_mark_notinit(*slot, true);
+            publish_notinit_slot(*slot);
 
             pgagroal_prometheus_server_error(server);
 
@@ -398,7 +432,7 @@ start:
             }
             else
             {
-               slot_mark_free(*slot, false);
+               publish_free_slot(*slot);
                goto retry;
             }
          }
@@ -466,19 +500,50 @@ retry:
 retry2:
       if (pgagroal_time_is_valid(config->blocking_timeout))
       {
-         /* Block on the rule's waiter notification group instead of
-          * polling: the process sleeps in the kernel with zero CPU usage
-          * until a slot is released (pgagroal_wait_group_notify from
-          * return/kill/rollback), the defensive re-check slice expires,
-          * or the blocking_timeout deadline passes (#813). The slice
-          * follows the same exponential back-off as the former polling
-          * loop (see next_retry_delay) so the wakeup budget matches
-          * upstream at high waiter counts. */
-         if (!wait_for_pool_change(config, best_rule, &block_deadline, &retry_delay))
+         /* Block on the rule's FIFO ticket group instead of polling: the
+          * process sleeps in the kernel with zero CPU usage until a slot
+          * is handed over (publish_free_slot from return/kill/rollback
+          * reserves it for this waiter), a creation event or the safety
+          * slice makes it re-run the acquisition pass, or the
+          * blocking_timeout deadline passes (#813). */
+         int wrc = wait_for_slot(config, best_rule, username, database, &block_deadline, slot, &wait_entry);
+
+         if (wrc == WAIT_SLOT_GRANTED)
+         {
+            /* Direct hand-off: the slot is already STATE_IN_USE and
+             * stamped with our pid by the producer - no acquisition race.
+             * Validate it like a reuse acquisition; every failure
+             * re-publishes the slot so the hand-off chain is never
+             * broken. */
+            do_init = false;
+            has_lock = false;
+
+            if (!holds_descriptor(*slot) && !fetch_descriptor(*slot))
+            {
+               publish_free_slot(*slot);
+               *slot = -1;
+               goto retry2;
+            }
+
+            if (!increase_connections(best_rule))
+            {
+               publish_free_slot(*slot);
+               *slot = -1;
+               goto retry;
+            }
+
+            has_lock = true;
+            goto have;
+         }
+
+         if (wrc == WAIT_SLOT_TIMEOUT)
          {
             goto timeout;
          }
 
+         /* WAIT_SLOT_PASS: the pool changed (creation slots, safety
+          * slice) - re-run the full acquisition pass. The wait ticket is
+          * kept across passes, so the FIFO position survives. */
          if (best_rule == -1)
          {
             remove_connection(username, database);
@@ -511,12 +576,34 @@ retry2:
             }
          }
          else
-         /* Block on the waiter notification group (was: a 1us busy-spin).
-          * There is no deadline, so the wait loops until a matching slot
-          * shows up, exactly like the former spin loop did; the slice
-          * backs off exactly like the blocking_timeout path above. */
+         /* Block on the FIFO ticket group (was: a 1us busy-spin). There
+          * is no deadline, so the wait loops until a matching slot is
+          * handed over; the safety slice bounds each nap. */
          {
-            wait_for_pool_change(config, best_rule, NULL, &retry_delay);
+            int wrc = wait_for_slot(config, best_rule, username, database, NULL, slot, &wait_entry);
+
+            if (wrc == WAIT_SLOT_GRANTED)
+            {
+               do_init = false;
+               has_lock = false;
+
+               if (!holds_descriptor(*slot) && !fetch_descriptor(*slot))
+               {
+                  publish_free_slot(*slot);
+                  *slot = -1;
+               }
+               else if (increase_connections(best_rule))
+               {
+                  has_lock = true;
+                  goto have;
+               }
+               else
+               {
+                  publish_free_slot(*slot);
+                  *slot = -1;
+               }
+            }
+
             goto start;
          }
       }
@@ -554,42 +641,6 @@ error:
    pgagroal_tracking_event_basic(TRACKER_GET_CONNECTION_ERROR, username, database);
 
    return 2;
-}
-
-long
-pgagroal_pool_next_retry_delay(long current_ns, int cap_ms)
-{
-   long cap_ns;
-   long next;
-
-   /* Keep the helper total even if handed an out-of-range cap; configuration
-    * validation is the primary guard, this is defence in depth. */
-   if (cap_ms < MIN_CONNECTION_RETRY_DELAY)
-   {
-      cap_ms = MIN_CONNECTION_RETRY_DELAY;
-   }
-   else if (cap_ms > MAX_CONNECTION_RETRY_DELAY)
-   {
-      cap_ms = MAX_CONNECTION_RETRY_DELAY;
-   }
-
-   cap_ns = (long)cap_ms * 1000000L;
-
-   if (current_ns <= 0)
-   {
-      next = 1000000L; /* 1ms seed */
-   }
-   else
-   {
-      next = current_ns * 2;
-   }
-
-   if (next > cap_ns)
-   {
-      next = cap_ns;
-   }
-
-   return next;
 }
 
 int
@@ -758,18 +809,18 @@ pgagroal_return_connection(int slot, SSL* ssl, bool transaction_mode)
          config->connections[slot].pid = -1;
          config->connections[slot].tx_mode = transaction_mode;
          memset(&config->connections[slot].appname, 0, sizeof(config->connections[slot].appname));
-         /* Release the checkout counter BEFORE marking the slot free:
-          * slot_mark_free wakes one waiter, and that waiter's acquisition
-          * pass starts with the active_connections saturation check. If
-          * the wake precedes the decrement, the woken waiter can observe
-          * the counter still at max_connections, skip the free-slot ring,
-          * and go back to sleep -- wasting the only wake this return
-          * earned and idling the slot until the next return. */
+         /* Release the checkout counter BEFORE publishing the slot:
+          * publish_free_slot reserves the slot for a waiter, and the
+          * granted waiter's validation re-checks the active_connections
+          * saturation gate. If the reservation precedes the decrement, the
+          * woken waiter can observe the counter still at max_connections,
+          * fail increase_connections and re-publish the slot -- wasting the
+          * hand-off and idling the slot until the next return. */
          if (release)
          {
             atomic_fetch_sub(&config->active_connections, 1);
          }
-         slot_mark_free(slot, true);
+         publish_free_slot(slot);
 
          pgagroal_log_debug("Connection returned: slot=%d, active_connections=%d, gracefully=%s",
                             slot, atomic_load(&config->active_connections), config->gracefully ? "true" : "false");
@@ -945,7 +996,7 @@ pgagroal_kill_connection(int slot, SSL* ssl)
    config->connections[slot].pid = -1;
    atomic_store(&config->connections[slot].generation, 0);
 
-   slot_mark_notinit(slot, true);
+   publish_notinit_slot(slot);
 
    pgagroal_prometheus_connection_kill();
 
@@ -999,7 +1050,7 @@ pgagroal_idle_timeout(void)
       {
          if (!holds_descriptor(i))
          {
-            slot_mark_free(i, false);
+            publish_free_slot(i);
             continue;
          }
 
@@ -1023,7 +1074,7 @@ pgagroal_idle_timeout(void)
             else
             {
                /* The slot is back in STATE_FREE: make sure it is queued */
-               slot_mark_free(i, false);
+               publish_free_slot(i);
             }
          }
       }
@@ -1069,7 +1120,7 @@ pgagroal_max_connection_age(void)
       {
          if (!holds_descriptor(i))
          {
-            slot_mark_free(i, false);
+            publish_free_slot(i);
             continue;
          }
 
@@ -1093,7 +1144,7 @@ pgagroal_max_connection_age(void)
             else
             {
                /* The slot is back in STATE_FREE: make sure it is queued */
-               slot_mark_free(i, false);
+               publish_free_slot(i);
             }
          }
       }
@@ -1138,7 +1189,7 @@ pgagroal_validation(void)
       {
          if (!holds_descriptor(i))
          {
-            slot_mark_free(i, false);
+            publish_free_slot(i);
             continue;
          }
 
@@ -1196,7 +1247,7 @@ pgagroal_validation(void)
             else
             {
                /* The slot is back in STATE_FREE: make sure it is queued */
-               slot_mark_free(i, false);
+               publish_free_slot(i);
             }
          }
       }
@@ -1262,7 +1313,7 @@ pgagroal_flush(int mode, char* database)
             {
                if (!holds_descriptor(i))
                {
-                  slot_mark_free(i, false);
+                  publish_free_slot(i);
                   continue;
                }
 
@@ -1597,15 +1648,54 @@ pgagroal_wait_group_init(struct pgagroal_wait_group* group)
    pthread_mutexattr_setpshared(&mattr, PTHREAD_PROCESS_SHARED);
    pthread_condattr_setpshared(&cattr, PTHREAD_PROCESS_SHARED);
 
+   group->mono_clock = 0;
+#if defined(__linux__) || defined(__FreeBSD__)
+   /* Prefer a monotonic condvar clock so the blocking_timeout deadline is
+    * immune to wall-clock adjustments (setclock is unavailable on macOS). */
+   group->mono_clock = (pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC) == 0);
+#endif
+   if (!group->mono_clock)
+   {
+      /* CLOCK_REALTIME condvars: translate monotonic deadlines through
+       * the realtime-vs-monotonic offset, captured once before any fork
+       * so every process computes identical deadlines. */
+      struct timespec mono;
+      struct timespec rt;
+
+      clock_gettime(CLOCK_MONOTONIC, &mono);
+      clock_gettime(CLOCK_REALTIME, &rt);
+      group->rt_offset_sec = (int)(rt.tv_sec - mono.tv_sec);
+      group->rt_offset_nsec = rt.tv_nsec - mono.tv_nsec;
+   }
+
    if (pthread_mutex_init(&group->mutex, &mattr))
    {
       pgagroal_log_error("pgagroal_wait_group_init: pthread_mutex_init failed (%s)", strerror(errno));
    }
-   if (pthread_cond_init(&group->cond, &cattr))
+   if (pthread_cond_init(&group->grant_cond, &cattr))
    {
       pgagroal_log_error("pgagroal_wait_group_init: pthread_cond_init failed (%s)", strerror(errno));
    }
+   if (pthread_cond_init(&group->retry_cond, &cattr))
+   {
+      pgagroal_log_error("pgagroal_wait_group_init: pthread_cond_init failed (%s)", strerror(errno));
+   }
+
+   group->gen = 0;
+   group->wake_gen = 0;
+   group->next_ticket = 0;
    group->waiters = 0;
+   group->overflow_waiters = 0;
+
+   for (int i = 0; i < PGAGROAL_WAITER_TABLE_SIZE; i++)
+   {
+      group->entries[i].ticket = 0;
+      group->entries[i].match = 0;
+      group->entries[i].pid = -1;
+      group->entries[i].granted_slot = -1;
+      group->entries[i].next_free = (i + 1 < PGAGROAL_WAITER_TABLE_SIZE) ? (i + 1) : -1;
+   }
+   group->free_head = (PGAGROAL_WAITER_TABLE_SIZE > 0) ? 0 : -1;
 
    pthread_mutexattr_destroy(&mattr);
    pthread_condattr_destroy(&cattr);
@@ -1700,7 +1790,7 @@ pgagroal_pool_shutdown(void)
             kill(config->connections[i].pid, SIGQUIT);
          }
 
-         slot_mark_notinit(i, false);
+         publish_notinit_slot(i);
       }
    }
 
@@ -1943,7 +2033,7 @@ remove_connection(char* username, char* database)
       {
          if (!holds_descriptor(idx))
          {
-            slot_mark_free(idx, false);
+            publish_free_slot(idx);
             continue;
          }
 
@@ -1957,7 +2047,7 @@ remove_connection(char* username, char* database)
             }
             else
             {
-               slot_mark_free(idx, false);
+               publish_free_slot(idx);
             }
          }
          else
@@ -2497,120 +2587,9 @@ requeue_notinit_slot(struct main_configuration* config, int slot)
    }
 }
 
-static void
-slot_mark_free(int slot, bool wake)
-{
-   struct main_configuration* config = (struct main_configuration*)shmem;
-
-   atomic_store(&config->states[slot], STATE_FREE);
-
-   /* Enqueue the candidate for acquirers. The dedup flag guarantees at
-    * most one queued entry per slot: push only when the flag exchanged
-    * 0 -> 1. If an entry is already queued (housekeeping briefly moved
-    * the slot out of STATE_FREE and back), the existing entry stands. */
-   if (atomic_exchange(&config->free_queued[slot], 1) == 0)
-   {
-      if (!pgagroal_queue_push(&config->free_slots, slot))
-      {
-         /* Cannot happen: capacity >= MAX_NUMBER_OF_CONNECTIONS and at
-          * most one entry per slot. Recover defensively so the slot is
-          * not lost. */
-         atomic_store(&config->free_queued[slot], 0);
-         pgagroal_log_error("slot_mark_free: free_slots queue full (slot %d)", slot);
-      }
-   }
-
-   if (wake)
-   {
-      wake_waiters(slot, true);
-   }
-}
-
-static void
-slot_mark_notinit(int slot, bool wake)
-{
-   struct main_configuration* config = (struct main_configuration*)shmem;
-
-   atomic_store(&config->states[slot], STATE_NOTINIT);
-
-   if (atomic_exchange(&config->notinit_queued[slot], 1) == 0)
-   {
-      if (!pgagroal_queue_push(&config->notinit_slots, slot))
-      {
-         atomic_store(&config->notinit_queued[slot], 0);
-         pgagroal_log_error("slot_mark_notinit: notinit_slots queue full (slot %d)", slot);
-      }
-   }
-
-   if (wake)
-   {
-      wake_waiters(slot, false);
-   }
-}
-
-static void
-pgagroal_wait_group_notify(struct pgagroal_wait_group* group)
-{
-   if (pthread_mutex_lock(&group->mutex))
-   {
-      return;
-   }
-
-   /* Only wake when somebody is actually blocked: with no waiters this is
-    * a no-op, whereas a semaphore would accumulate a stale credit that
-    * wakes a future waiter without a new slot having been released. A
-    * waiter that entered cond_timedwait before the producer locked the
-    * mutex cannot miss the signal, because cond_timedwait releases the
-    * same mutex atomically. */
-   if (group->waiters > 0)
-   {
-      pthread_cond_signal(&group->cond);
-   }
-
-   pthread_mutex_unlock(&group->mutex);
-}
-
-static void
-wake_waiters(int slot, bool is_free)
-{
-   char* username;
-   char* database;
-   struct main_configuration* config = (struct main_configuration*)shmem;
-
-   if (!is_free)
-   {
-      /* A killed (STATE_NOTINIT) slot can be turned into a new connection
-       * by any rule, so every waiter is eligible. Waking a waiter whose
-       * rule is still saturated is harmless: it re-checks and blocks
-       * again (one futex wake at most). */
-      for (int i = 0; i < config->number_of_limits; i++)
-      {
-         pgagroal_wait_group_notify(&config->limit_waits[i]);
-      }
-      pgagroal_wait_group_notify(&config->no_limit_wait);
-      return;
-   }
-
-   /* A returned (STATE_FREE) connection can only be reused by a request
-    * whose user/database the connection matches (the reuse path), so only
-    * the rules whose pattern matches the returned connection are woken.
-    * Note: this must not read connections[slot] on the kill path -- there
-    * the fields are already cleared -- which is why the kill path returns
-    * above. */
-   username = (char*)&config->connections[slot].username;
-   database = (char*)&config->connections[slot].database;
-
-   for (int i = 0; i < config->number_of_limits; i++)
-   {
-      if ((pgagroal_strcmp("all", config->limits[i].username) || pgagroal_strcmp(username, config->limits[i].username)) &&
-          (pgagroal_strcmp("all", config->limits[i].database) || pgagroal_strcmp(database, config->limits[i].database)))
-      {
-         pgagroal_wait_group_notify(&config->limit_waits[i]);
-      }
-   }
-
-   pgagroal_wait_group_notify(&config->no_limit_wait);
-}
+/* ------------------------------------------------------------------
+ * Queue 2: FIFO wait groups with direct slot hand-off.
+ * ------------------------------------------------------------------ */
 
 static void
 timespec_add_ns(struct timespec* ts, long ns)
@@ -2633,72 +2612,536 @@ timespec_less(struct timespec* a, struct timespec* b)
    return a->tv_nsec < b->tv_nsec;
 }
 
-static bool
-wait_for_pool_change(struct main_configuration* config, int best_rule, struct timespec* deadline, long* retry_delay)
+static struct pgagroal_wait_group*
+group_for_rule(struct main_configuration* config, int best_rule)
 {
-   struct pgagroal_wait_group* group;
-   struct timespec now;
-   struct timespec wake_up;
-   long slice;
-   int rc;
+   return (best_rule >= 0 && best_rule < NUMBER_OF_LIMITS)
+             ? &config->limit_waits[best_rule]
+             : &config->no_limit_wait;
+}
 
-   /* Wait on the notification group of the request's rule (or the global
-    * one when no rule matched). Producers notify on every availability
-    * event, so a wakeup means the pool may have changed and the
-    * acquisition pass is retried. */
-   group = (best_rule >= 0) ? &config->limit_waits[best_rule] : &config->no_limit_wait;
+/* FNV-1a over the exact identity triple the reuse path requires
+ * (username, resolved database, limit rule), so a producer never spends
+ * a hand-off on a waiter that cannot reuse the slot. Hash collisions are
+ * harmless: the granted waiter re-validates can_reuse after waking and
+ * re-publishes the slot on a mismatch. */
+static uint64_t
+waiter_match_hash(char* username, char* database, int best_rule)
+{
+   uint64_t h = 1469598103934665603ULL;
+   char rule[16];
+   const char* parts[3];
 
-   /* Exponential back-off for the defensive re-check slice (1ms seed,
-    * doubling, capped at connection_retry_delay). Signals are the primary
-    * wakeup path; the slice only covers the rare missed-signal window, so
-    * it must stay as cheap as the upstream polling loop it replaced --
-    * a fixed short slice multiplies the kernel wakeup budget by the
-    * waiter count and starves the rest of the system under heavy
-    * oversubscription. */
-   slice = pgagroal_pool_next_retry_delay(*retry_delay, config->connection_retry_delay);
-   *retry_delay = slice;
+   pgagroal_snprintf(&rule[0], sizeof(rule), "%d", best_rule);
+   parts[0] = username;
+   parts[1] = database;
+   parts[2] = &rule[0];
 
-   clock_gettime(CLOCK_REALTIME, &now);
-   wake_up = now;
-   timespec_add_ns(&wake_up, slice);
-
-   /* Never sleep past the acquisition deadline */
-   if (deadline != NULL && timespec_less(deadline, &wake_up))
+   for (int p = 0; p < 3; p++)
    {
-      wake_up = *deadline;
+      for (const char* s = parts[p]; *s != '\0'; s++)
+      {
+         h ^= (uint64_t)(unsigned char)*s;
+         h *= 1099511628211ULL;
+      }
+      h ^= 0x1f;
+      h *= 1099511628211ULL;
    }
 
-   /* Block on the rule's condition variable instead of polling: the
-    * process sleeps in the kernel with zero CPU usage until a slot is
-    * released (pgagroal_wait_group_notify from return/kill/rollback), the
-    * defensive re-check slice expires, or the blocking_timeout deadline
-    * passes (#813). pthread_cond_timedwait() may also return spuriously;
-    * like any wakeup it merely triggers a fresh acquisition pass, whose
-    * CAS-based commit on states[slot] is the real correctness guard. */
-   pthread_mutex_lock(&group->mutex);
-   group->waiters++;
-   rc = pthread_cond_timedwait(&group->cond, &group->mutex, &wake_up);
-   group->waiters--;
-   pthread_mutex_unlock(&group->mutex);
+   return h;
+}
 
-   if (rc == 0)
+static uint64_t
+slot_match_hash(struct main_configuration* config, int slot)
+{
+   return waiter_match_hash((char*)&config->connections[slot].username[0],
+                            (char*)&config->connections[slot].database[0],
+                            config->connections[slot].limit_rule);
+}
+
+static bool
+waiter_alive(const struct pgagroal_waiter_entry* entry)
+{
+   /* kill(pid, 0) probes for existence: ESRCH means the waiting worker
+    * died while queued and its ticket must be reclaimed. EPERM means the
+    * process exists but is owned by another user: treat as alive. */
+   if (entry->pid == -1)
    {
-      /* Woken by a producer (waiters > 0 guaranteed a real signal) */
-      *retry_delay = 0;
+      return false;
+   }
+   if (kill(entry->pid, 0) == 0)
+   {
       return true;
    }
+   return errno != ESRCH;
+}
 
-   if (deadline != NULL)
+static void
+waiter_recycle(struct pgagroal_wait_group* group, struct pgagroal_waiter_entry* entry)
+{
+   entry->pid = -1;
+   entry->ticket = 0;
+   entry->match = 0;
+   entry->granted_slot = -1;
+   entry->next_free = group->free_head;
+   group->free_head = (int32_t)(entry - group->entries);
+   group->waiters--;
+}
+
+static void
+waiter_gen_signal(struct pgagroal_wait_group* group)
+{
+   /* Bump the generation and wake exactly one overflow waiter: the event
+   * is visible to all of them through gen, and the safety slice covers
+   * the rest, which keeps the thundering herd bounded. */
+   group->gen++;
+   if (group->overflow_waiters > 0)
    {
-      clock_gettime(CLOCK_REALTIME, &now);
-      if (timespec_less(deadline, &now))
+      pthread_cond_signal(&group->retry_cond);
+   }
+}
+
+/* Translate an absolute CLOCK_MONOTONIC deadline into the condvar clock
+ * (CLOCK_MONOTONIC where supported; CLOCK_REALTIME through the offset
+ * captured at init otherwise, e.g. on macOS). */
+static void
+wait_group_abstime(struct pgagroal_wait_group* group, struct timespec* out, struct timespec* mono_deadline)
+{
+   if (group->mono_clock)
+   {
+      *out = *mono_deadline;
+      return;
+   }
+
+   out->tv_sec = mono_deadline->tv_sec + group->rt_offset_sec;
+   out->tv_nsec = mono_deadline->tv_nsec + group->rt_offset_nsec;
+   while (out->tv_nsec < 0)
+   {
+      out->tv_sec -= 1;
+      out->tv_nsec += 1000000000L;
+   }
+   while (out->tv_nsec >= 1000000000L)
+   {
+      out->tv_sec += 1;
+      out->tv_nsec -= 1000000000L;
+   }
+}
+
+static bool
+mono_deadline_passed(struct timespec* deadline)
+{
+   struct timespec now;
+
+   if (deadline == NULL)
+   {
+      return false;
+   }
+
+   clock_gettime(CLOCK_MONOTONIC, &now);
+
+   return !timespec_less(&now, deadline);
+}
+
+/* Make a returned slot visible (producer side, Queue 2). The slot must be
+ * STATE_IN_USE with its checkout counters already released; its identity
+ * fields are still intact.
+ *
+ * Direct hand-off: under the rule group's mutex, reserve the slot for the
+ * oldest live waiter whose match hash equals the slot's - the waiter is
+ * woken with granted_slot set and the slot already STATE_IN_USE and
+ * stamped with its pid, so it skips the acquisition race, no fresh
+ * arrival can barge, and no wakeup can be lost (predicate and state are
+ * written and read under the same mutex).
+ *
+ * When nobody can reuse the slot, it goes to the lock-free free-slot ring
+ * for the unsaturated fast path, and the generation bump lets overflow
+ * waiters re-check. Dead waiters are reclaimed so a crashed process can
+ * never block the FIFO. */
+static void
+publish_free_slot(int slot)
+{
+   struct main_configuration* config = (struct main_configuration*)shmem;
+   struct pgagroal_wait_group* group;
+   struct pgagroal_waiter_entry* entry;
+   struct pgagroal_waiter_entry* best = NULL;
+   bool recycled = false;
+   uint64_t h;
+
+   /* Snapshot the identity BEFORE making the slot visible: once it is
+    * STATE_FREE another acquirer may take it and overwrite the fields. */
+   h = slot_match_hash(config, slot);
+   group = group_for_rule(config, config->connections[slot].limit_rule);
+
+   if (pthread_mutex_lock(&group->mutex))
+   {
+      /* Mutex unusable (post-crash, non-robust process-shared mutexes):
+       * fall back to the lock-free ring so the slot is not lost. */
+      atomic_store(&config->states[slot], STATE_FREE);
+      requeue_free_slot(config, slot);
+      return;
+   }
+
+   for (int i = 0; i < PGAGROAL_WAITER_TABLE_SIZE; i++)
+   {
+      entry = &group->entries[i];
+
+      if (entry->pid == -1 || entry->granted_slot != -1 || entry->match != h)
       {
-         /* The blocking_timeout deadline has passed */
-         return false;
+         continue;
+      }
+
+      if (!waiter_alive(entry))
+      {
+         /* A queued waiter died (SIGKILL while waiting): reclaim its
+          * ticket so it cannot block the FIFO head forever. */
+         waiter_recycle(group, entry);
+         recycled = true;
+         continue;
+      }
+
+      if (best == NULL || entry->ticket < best->ticket)
+      {
+         best = entry;
       }
    }
 
-   /* The slice expired (or the call was interrupted): re-run the
-    * acquisition pass, which also covers entries that raced in flight. */
-   return true;
+   if (best != NULL)
+   {
+      /* Reserve the slot for the waiter: it never passes through
+       * STATE_FREE, so no concurrent acquirer can take it. */
+      config->connections[slot].pid = best->pid;
+      atomic_store(&config->states[slot], STATE_IN_USE);
+      best->granted_slot = slot;
+      pthread_cond_broadcast(&group->grant_cond);
+      if (recycled)
+      {
+         waiter_gen_signal(group);
+      }
+      pthread_mutex_unlock(&group->mutex);
+      return;
+   }
+
+   atomic_store(&config->states[slot], STATE_FREE);
+   requeue_free_slot(config, slot);
+   waiter_gen_signal(group);
+   pthread_mutex_unlock(&group->mutex);
+}
+
+/* Make a killed/recycled slot visible for the creation path (producer
+ * side). Creation slots can serve any rule's waiter, so every group is
+ * signalled: wake_gen makes ticketed waiters re-run their creation pass
+ * and gen lets overflow waiters re-check. The slot itself is not
+ * reserved: creation extends capacity rather than handing off a
+ * particular backend, and the NOTINIT -> INIT commit stays a CAS in the
+ * acquisition pass. */
+static void
+publish_notinit_slot(int slot)
+{
+   struct main_configuration* config = (struct main_configuration*)shmem;
+
+   atomic_store(&config->states[slot], STATE_NOTINIT);
+
+   if (atomic_exchange(&config->notinit_queued[slot], 1) == 0)
+   {
+      if (!pgagroal_queue_push(&config->notinit_slots, slot))
+      {
+         atomic_store(&config->notinit_queued[slot], 0);
+         pgagroal_log_error("publish_notinit_slot: notinit_slots queue full (slot %d)", slot);
+      }
+   }
+
+   for (int i = 0; i <= config->number_of_limits; i++)
+   {
+      struct pgagroal_wait_group* group;
+      bool no_limit = (i == config->number_of_limits);
+
+      group = no_limit ? &config->no_limit_wait : &config->limit_waits[i];
+
+      if (pthread_mutex_lock(&group->mutex))
+      {
+         continue;
+      }
+
+      group->wake_gen++;
+      group->gen++;
+      if (group->overflow_waiters > 0)
+      {
+         pthread_cond_signal(&group->retry_cond);
+      }
+      /* Ticketed waiters whose predicate (granted_slot) is unchanged
+       * re-sleep immediately; those watching wake_gen re-run the creation
+       * pass. Bounded herd: the ticket table caps the broadcast. */
+      pthread_cond_broadcast(&group->grant_cond);
+      pthread_mutex_unlock(&group->mutex);
+   }
+}
+
+/* Leave the wait queue: releases the ticket (or the overflow slot) and,
+ * if a slot was reserved for us while we were out, re-publishes it so the
+ * hand-off is not lost. */
+static void
+waiter_leave(struct main_configuration* config, int best_rule, int wait_entry)
+{
+   struct pgagroal_wait_group* group;
+   struct pgagroal_waiter_entry* entry;
+   int32_t granted = -1;
+
+   group = group_for_rule(config, best_rule);
+
+   if (wait_entry == -2)
+   {
+      pthread_mutex_lock(&group->mutex);
+      group->overflow_waiters--;
+      pthread_mutex_unlock(&group->mutex);
+      return;
+   }
+
+   if (wait_entry < 0)
+   {
+      return;
+   }
+
+   pthread_mutex_lock(&group->mutex);
+   entry = &group->entries[wait_entry];
+   if (entry->pid == getpid())
+   {
+      granted = entry->granted_slot;
+      waiter_recycle(group, entry);
+      waiter_gen_signal(group);
+   }
+   pthread_mutex_unlock(&group->mutex);
+
+   if (granted >= 0)
+   {
+      /* We acquired a slot elsewhere while a hand-off was reserved for
+       * us: forward it to the next waiter instead of losing it. */
+      publish_free_slot(granted);
+   }
+}
+
+/* Wait for a pool slot (consumer side, Queue 2). Registers a FIFO ticket
+ * in the rule's group and sleeps on grant_cond until a producer reserves
+ * a slot for this waiter, a creation event fires (wake_gen), the safety
+ * slice expires (re-run the acquisition pass) or the deadline passes.
+ *
+ * A last-chance acquisition (free ring + states[] scan) runs under the
+ * group mutex at registration, which closes the check-then-wait window:
+ * a slot published between the caller's failed pass and this lock is
+ * found here, so a wakeup can never be lost.
+ *
+ * Returns WAIT_SLOT_GRANTED with the reserved slot in *slot (already
+ * STATE_IN_USE and owned by this process - the caller validates it),
+ * WAIT_SLOT_PASS when the acquisition pass should be re-run, or
+ * WAIT_SLOT_TIMEOUT when the deadline expired (NULL deadline = never).
+ *
+ * *wait_entry carries the registration across calls: it survives goto
+ * start so the waiter keeps its FIFO position while re-running the
+ * acquisition pass. -2 marks overflow mode (ticket table full). */
+static int
+wait_for_slot(struct main_configuration* config, int best_rule, char* username, char* database,
+              struct timespec* deadline, int* slot, int* wait_entry)
+{
+   struct pgagroal_wait_group* group;
+   struct pgagroal_waiter_entry* entry;
+   struct timespec now;
+   struct timespec slice_deadline;
+   struct timespec abstime;
+   uint64_t h;
+   uint64_t seen_wake;
+   uint64_t seen_gen = 0;
+   char* real_database;
+   int32_t idx;
+
+   group = group_for_rule(config, best_rule);
+
+   *slot = -1;
+
+   /* ---- Register / last-chance acquisition ---- */
+
+   pthread_mutex_lock(&group->mutex);
+
+   real_database = resolve_database_name(database, best_rule);
+   h = waiter_match_hash(username, real_database, best_rule);
+
+   /* Free-slot ring first (O(1) per candidate): entries whose slot cannot
+    * be reused by this request are re-queued. The attempt bound keeps the
+    * pass finite because re-queued entries reappear at the tail. */
+   int ring_attempts = 0;
+
+   while (ring_attempts++ < config->max_connections && pop_free_slot(config, &idx))
+   {
+      signed char state = STATE_FREE;
+
+      if (atomic_compare_exchange_strong(&config->states[idx], &state, STATE_IN_USE))
+      {
+         if (slot_match_hash(config, idx) == h)
+         {
+            pthread_mutex_unlock(&group->mutex);
+            *slot = idx;
+            return WAIT_SLOT_GRANTED;
+         }
+         requeue_free_slot(config, idx);
+      }
+      else if (atomic_load(&config->states[idx]) == STATE_FREE)
+      {
+         /* Stale entry, but the slot is free again: re-advertise it. */
+         requeue_free_slot(config, idx);
+      }
+   }
+
+   /* The states[] scan catches slots that are STATE_FREE without a ring
+    * entry (defence in depth: the ring is a hint, the state is truth). */
+   for (idx = 0; idx < config->max_connections; idx++)
+   {
+      signed char state = STATE_FREE;
+
+      if (atomic_load(&config->states[idx]) == STATE_FREE &&
+          slot_match_hash(config, idx) == h &&
+          atomic_compare_exchange_strong(&config->states[idx], &state, STATE_IN_USE))
+      {
+         pthread_mutex_unlock(&group->mutex);
+         *slot = idx;
+         return WAIT_SLOT_GRANTED;
+      }
+   }
+
+   if (*wait_entry == -1)
+   {
+      int32_t e = group->free_head;
+
+      if (e != -1)
+      {
+         /* First registration: take a FIFO ticket. */
+         entry = &group->entries[e];
+         group->free_head = entry->next_free;
+         entry->ticket = ++group->next_ticket;
+         entry->match = h;
+         entry->pid = getpid();
+         entry->granted_slot = -1;
+         entry->next_free = -1;
+         group->waiters++;
+         *wait_entry = e;
+      }
+      else
+      {
+         /* Ticket table full: overflow mode. Wakeup-lossless through the
+          * generation counter, best-effort order, promoted into the FIFO
+          * whenever an entry frees up. */
+         group->overflow_waiters++;
+         *wait_entry = -2;
+         seen_gen = group->gen;
+      }
+   }
+   else if (*wait_entry == -2)
+   {
+      seen_gen = group->gen;
+   }
+
+   seen_wake = group->wake_gen;
+   pthread_mutex_unlock(&group->mutex);
+
+   /* ---- Wait ---- */
+
+   for (;;)
+   {
+      if (mono_deadline_passed(deadline))
+      {
+         waiter_leave(config, best_rule, *wait_entry);
+         *wait_entry = -1;
+         return WAIT_SLOT_TIMEOUT;
+      }
+
+      /* Safety slice: a bounded nap so the waiter periodically re-runs
+       * the acquisition pass even without a wakeup (creation slots, stray
+       * entries). connection_retry_delay (default 250ms) keeps the slice
+       * budget identical to the former polling loop under massive
+       * oversubscription. */
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      slice_deadline = now;
+      timespec_add_ns(&slice_deadline, (long)config->connection_retry_delay * 1000000L);
+      if (deadline != NULL && timespec_less(deadline, &slice_deadline))
+      {
+         slice_deadline = *deadline;
+      }
+      wait_group_abstime(group, &abstime, &slice_deadline);
+
+      if (*wait_entry == -2)
+      {
+         int promoted = 0;
+
+         pthread_mutex_lock(&group->mutex);
+         while (group->gen == seen_gen)
+         {
+            if (pthread_cond_timedwait(&group->retry_cond, &group->mutex, &abstime) != 0)
+            {
+               break;
+            }
+         }
+         if (group->gen != seen_gen)
+         {
+            seen_gen = group->gen;
+            if (group->free_head != -1)
+            {
+               /* An entry freed up: promote into the FIFO. */
+               int32_t e = group->free_head;
+
+               entry = &group->entries[e];
+               group->free_head = entry->next_free;
+               entry->ticket = ++group->next_ticket;
+               entry->match = h;
+               entry->pid = getpid();
+               entry->granted_slot = -1;
+               entry->next_free = -1;
+               group->waiters++;
+               group->overflow_waiters--;
+               *wait_entry = e;
+               promoted = 1;
+            }
+         }
+         pthread_mutex_unlock(&group->mutex);
+
+         if (!promoted)
+         {
+            /* Slice expired or event seen: re-run the acquisition pass
+             * (its registration re-checks the pool under the lock). */
+            return WAIT_SLOT_PASS;
+         }
+
+         /* Promoted: fall through to the ticketed wait. */
+      }
+
+      /* Ticketed wait: the predicate is this waiter's granted_slot. */
+      pthread_mutex_lock(&group->mutex);
+      entry = &group->entries[*wait_entry];
+      while (entry->granted_slot == -1 && group->wake_gen == seen_wake)
+      {
+         if (pthread_cond_timedwait(&group->grant_cond, &group->mutex, &abstime) != 0)
+         {
+            break;
+         }
+      }
+      if (entry->granted_slot >= 0)
+      {
+         /* Direct hand-off: the slot was reserved (STATE_IN_USE, our pid)
+          * by the producer while we slept. */
+         *slot = entry->granted_slot;
+         entry->granted_slot = -1;
+         waiter_recycle(group, entry);
+         waiter_gen_signal(group);
+         pthread_mutex_unlock(&group->mutex);
+         *wait_entry = -1;
+         return WAIT_SLOT_GRANTED;
+      }
+      if (group->wake_gen != seen_wake)
+      {
+         /* A creation slot appeared: re-run the acquisition pass. */
+         pthread_mutex_unlock(&group->mutex);
+         return WAIT_SLOT_PASS;
+      }
+      pthread_mutex_unlock(&group->mutex);
+
+      /* Slice expired without a grant: re-run the acquisition pass; the
+       * registration section re-checks the pool under the lock first. */
+      return WAIT_SLOT_PASS;
+   }
 }
